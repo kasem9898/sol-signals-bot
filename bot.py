@@ -100,10 +100,8 @@ def analyze():
 
 send_message("✅ بدأ بوت SOLUSDT، وسيحلل الشموع المغلقة كل 5 دقائق.")
 
-while True:
-    try:
-        analyze()
-    except Exception as error:
-        print("خطأ:", error)
-
-    time.sleep(60)
+try:
+    analyze()
+except Exception as error:
+    print("Analysis error:", error)
+    raise
