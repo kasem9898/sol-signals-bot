@@ -65,7 +65,7 @@ candle_time = closed[-1][0]
 price = closes[-1]
 price = closes[-1]
 
-    if candle_time == last_candle:
+if candle_time == last_candle:
         return
 
     last_candle = candle_time
@@ -75,7 +75,7 @@ price = closes[-1]
 
     changes = [
         closes[i] - closes[i - 1]
-        for i in range(len(closes) - 14, len(closes))
+for i in range(len(closes) - 14, len(closes))
     ]
 
     gains = [max(change, 0) for change in changes[-14:]]
