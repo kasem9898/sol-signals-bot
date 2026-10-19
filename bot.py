@@ -111,10 +111,8 @@ def analyze():
         last_signal = signal
 
 
-send_message("✅ بدأ بوت SOLUSDT Futures، وسيحلل الشموع المغلقة.")
-
 try:
-    analyze()
+analyze()
 except Exception as error:
-    print("Analysis error:", error)
-    raise
+print("Analysis error:", error)
+raise
