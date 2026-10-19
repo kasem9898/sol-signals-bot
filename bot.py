@@ -5,7 +5,7 @@ import requests
 TOKEN = os.environ["TELEGRAM_TOKEN"]
 CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
-BINANCE_URL = "https://fapi.binance.com/fapi/v1/klines"
+BINANCE_URL = "https://api.binance.com/api/v3/klines"
 TELEGRAM_URL = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
 
 last_signal = None
@@ -84,7 +84,7 @@ def analyze():
 
     if signal and signal != last_signal:
         message = (
-            f"📊 إشارة SOLUSDT Futures\n"
+            f"📊 إشارة SOLUSDT Spot\n"
             f"⏱ الفريم: 5 دقائق\n"
             f"📍 الإشارة: {signal}\n"
             f"💵 السعر: {price:.4f}\n"
