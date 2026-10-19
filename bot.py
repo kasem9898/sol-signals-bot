@@ -75,7 +75,7 @@ if candle_time == last_candle:
 
     changes = [
         closes[i] - closes[i - 1]
-for i in range(len(closes) - 14, len(closes))
+        for i in range(len(closes) - 14, len(closes))
     ]
 
     gains = [max(change, 0) for change in changes[-14:]]
@@ -98,7 +98,7 @@ for i in range(len(closes) - 14, len(closes))
 
     if signal and signal != last_signal:
         message = (
-            f"📊 إشارة SOLUSDT Spot\n"
+            f"📊 إشارة SOLUSDT Futures\n"
             f"⏱ الفريم: 5 دقائق\n"
             f"📍 الإشارة: {signal}\n"
             f"💵 السعر: {price:.4f}\n"
@@ -108,11 +108,12 @@ for i in range(len(closes) - 14, len(closes))
             f"⚠️ إشارة فنية وليست ضماناً للربح.\n"
             f"حدد وقف الخسارة قبل أي صفقة."
         )
+
         send_message(message)
         last_signal = signal
 
 
-send_message("✅ بدأ بوت SOLUSDT، وسيحلل الشموع المغلقة كل 5 دقائق.")
+send_message("✅ بدأ بوت SOLUSDT Futures، وسيحلل الشموع المغلقة.")
 
 try:
     analyze()
