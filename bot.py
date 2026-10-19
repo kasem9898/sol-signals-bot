@@ -34,21 +34,35 @@ def analyze():
     global last_signal, last_candle
 
     response = requests.get(
-        BINANCE_URL,
-        params={
-            "symbol": "SOLUSDT",
-            "interval": "5m",
-            "limit": 100
-        },
-        timeout=15
-    )
-    response.raise_for_status()
-    candles = response.json()
+    BINANCE_URL,
+    params={
+        "instId": "SOL-USDT-SWAP",
+        "bar": "5m",
+        "limit": "100"
+    },
+    timeout=15
+)
 
-    # استخدام الشموع المغلقة فقط
-    closed = candles[:-1]
-    closes = [float(candle[4]) for candle in closed]
-    candle_time = closed[-1][0]
+response.raise_for_status()
+result = response.json()
+
+if result.get("code") != "0":
+    raise Exception(f"OKX API error: {result}")
+
+candles = result["data"]
+
+# نستخدم الشموع المكتملة فقط
+closed = [candle for candle in candles if candle[8] == "1"]
+
+if len(closed) < 30:
+    raise Exception("Not enough closed candles")
+
+# بيانات OKX مرتبة من الأحدث إلى الأقدم
+closed = list(reversed(closed))
+
+closes = [float(candle[4]) for candle in closed]
+candle_time = closed[-1][0]
+price = closes[-1]
     price = closes[-1]
 
     if candle_time == last_candle:
