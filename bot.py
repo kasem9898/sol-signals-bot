@@ -5,7 +5,7 @@ import requests
 TOKEN = os.environ["TELEGRAM_TOKEN"]
 CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
-BINANCE_URL = "https://api.binance.com/api/v3/klines"
+BINANCE_URL = "https://www.okx.com/api/v5/market/candles"
 TELEGRAM_URL = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
 
 last_signal = None
