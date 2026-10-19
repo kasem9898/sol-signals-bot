@@ -63,7 +63,7 @@ closed = list(reversed(closed))
 closes = [float(candle[4]) for candle in closed]
 candle_time = closed[-1][0]
 price = closes[-1]
-    price = closes[-1]
+price = closes[-1]
 
     if candle_time == last_candle:
         return
