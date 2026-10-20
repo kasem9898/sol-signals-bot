@@ -109,8 +109,8 @@ def analyze():
 
         send_message(message)
         last_signal = signal
-
-
+        
+        
 try:
 analyze()
 except Exception as error:
