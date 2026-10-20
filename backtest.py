@@ -272,5 +272,59 @@ def test_strategy(name, signals, opens, highs, lows, closes,
         "final_balance": balance
     }
 
+def main():
+    print("Starting SOL-USDT-SWAP backtest...")
+
+    candles = get_candles()
+
+    if not candles:
+        print("ERROR: No candles were downloaded.")
+        return
+
+    print(f"Downloaded candles: {len(candles)}")
+
+    opens, highs, lows, closes, ats, signals = make_signals(candles)
+
+    total = len(candles)
+    split = int(total * 0.70)
+
+    print(f"Development candles: {split}")
+    print(f"Out-of-sample candles: {total - split}")
+    print("\n===== BACKTEST RESULTS =====")
+
+    for name, strategy_signals in signals.items():
+        development = test_strategy(
+            name, strategy_signals, opens, highs, lows, closes,
+            ats, 201, split
+        )
+
+        out_sample = test_strategy(
+            name, strategy_signals, opens, highs, lows, closes,
+            ats, split, total - 1
+        )
+
+        print(f"\nStrategy: {name}")
+
+        print("--- Development (70%) ---")
+        print(f"Trades: {development['count']}")
+        print(f"Win rate: {development['winrate']:.2f}%")
+        print(f"Net P/L: {development['net']:.2f} USDT")
+        print(f"Return: {development['return_pct']:.2f}%")
+        print(f"Profit factor: {development['pf']:.2f}")
+        print(f"Max drawdown: {development['drawdown']:.2f}%")
+        print(f"Final balance: {development['final_balance']:.2f} USDT")
+
+        print("--- Out-of-sample (30%) ---")
+        print(f"Trades: {out_sample['count']}")
+        print(f"Win rate: {out_sample['winrate']:.2f}%")
+        print(f"Net P/L: {out_sample['net']:.2f} USDT")
+        print(f"Return: {out_sample['return_pct']:.2f}%")
+        print(f"Profit factor: {out_sample['pf']:.2f}")
+        print(f"Max drawdown: {out_sample['drawdown']:.2f}%")
+        print(f"Final balance: {out_sample['final_balance']:.2f} USDT")
+
+    print("\n===== BACKTEST FINISHED =====")
+
+
 if __name__ == "__main__":
     main()
