@@ -10,9 +10,16 @@ START_BALANCE = 1000.0
 RISK_PERCENT = 0.01
 FEE = 0.0005
 SLIPPAGE = 0.0002
-ATR_STOP = 1.5
 REWARD_R = 2.0
 MAX_HOLD = 48
+
+LOOKBACK = 48
+ATR_PERIOD = 14
+ZONE_ATR = 0.35
+STOP_BUFFER_ATR = 0.25
+MIN_BODY_RATIO = 0.35
+MIN_RISK_ATR = 0.50
+MAX_RISK_ATR = 2.50
 
 
 def get_candles():
@@ -24,7 +31,12 @@ def get_candles():
     after = None
 
     for _ in range(320):
-        params = {"instId": SYMBOL, "bar": "5m", "limit": "100"}
+        params = {
+            "instId": SYMBOL,
+            "bar": "5m",
+            "limit": "100"
+        }
+
         if after:
             params["after"] = after
 
@@ -45,13 +57,18 @@ def get_candles():
                 data[ts] = row
 
         oldest = min(int(row[0]) for row in rows)
-        print("Candles:", len(data), "| Oldest UTC:",
-              datetime.fromtimestamp(
-                  oldest / 1000, timezone.utc
-              ).strftime("%Y-%m-%d %H:%M"))
+
+        print(
+            "Candles:", len(data),
+            "| Oldest UTC:",
+            datetime.fromtimestamp(
+                oldest / 1000, timezone.utc
+            ).strftime("%Y-%m-%d %H:%M")
+        )
 
         if oldest <= start:
             break
+
         if after == str(oldest):
             break
 
@@ -59,6 +76,7 @@ def get_candles():
         time.sleep(0.15)
 
     candles = [data[k] for k in sorted(data)]
+
     if len(candles) < 3000:
         raise RuntimeError(
             f"Insufficient data: {len(candles)} candles"
@@ -70,28 +88,36 @@ def get_candles():
 def ema(values, period):
     alpha = 2 / (period + 1)
     out = [values[0]]
+
     for value in values[1:]:
-        out.append(alpha * value + (1 - alpha) * out[-1])
+        out.append(
+            alpha * value + (1 - alpha) * out[-1]
+        )
+
     return out
 
 
 def rsi(values, period=14):
     out = [None] * len(values)
+
     for i in range(period, len(values)):
         changes = [
             values[j] - values[j - 1]
             for j in range(i - period + 1, i + 1)
         ]
+
         gains = sum(max(x, 0) for x in changes) / period
         losses = sum(max(-x, 0) for x in changes) / period
+
         if losses == 0:
             out[i] = 100 if gains else 50
         else:
             out[i] = 100 - 100 / (1 + gains / losses)
+
     return out
 
 
-def atr(highs, lows, closes, period=14):
+def atr(highs, lows, closes, period=ATR_PERIOD):
     ranges = [None]
     out = [None] * len(closes)
 
@@ -103,7 +129,9 @@ def atr(highs, lows, closes, period=14):
         ))
 
     for i in range(period, len(closes)):
-        out[i] = sum(ranges[i - period + 1:i + 1]) / period
+        out[i] = (
+            sum(ranges[i - period + 1:i + 1]) / period
+        )
 
     return out
 
@@ -114,73 +142,24 @@ def make_signals(candles):
     lows = [float(c[3]) for c in candles]
     closes = [float(c[4]) for c in candles]
 
-    e9 = ema(closes, 9)
-    e20 = ema(closes, 20)
-    e21 = ema(closes, 21)
     e50 = ema(closes, 50)
-    e200 = ema(closes, 200)
     rs = rsi(closes)
     ats = atr(highs, lows, closes)
 
-    names = [
-        "EMA9/21 + EMA50 + RSI",
-        "EMA50/200 trend + RSI",
-        "20-candle breakout",
-        "EMA20/50 pullback",
-        "Support/Resistance + Supply/Demand"
-    ]
+    signals = {
+        "BOUNCE_LONG": [None] * len(candles),
+        "BOUNCE_SHORT": [None] * len(candles),
+        "RETEST_LONG": [None] * len(candles),
+        "RETEST_SHORT": [None] * len(candles)
+    }
 
-    signals = {name: [None] * len(candles) for name in names}
+    # Retest state: a breakout must happen first.
+    breakout_up = [False] * len(candles)
+    breakout_down = [False] * len(candles)
 
-    # Parameters for the support/resistance strategy
-    LOOKBACK = 48
-    ZONE_ATR = 0.35
-    MIN_BODY_RATIO = 0.35
-
-    for i in range(201, len(candles) - 1):
+    for i in range(LOOKBACK + 2, len(candles) - 1):
         if ats[i] is None or ats[i] <= 0 or rs[i] is None:
             continue
-
-        # Strategy 1: EMA9/21 + EMA50 + RSI
-        if (e9[i - 1] <= e21[i - 1] and e9[i] > e21[i]
-                and closes[i] > e50[i] and 50 < rs[i] < 68):
-            signals[names[0]][i] = "LONG"
-        elif (e9[i - 1] >= e21[i - 1] and e9[i] < e21[i]
-                and closes[i] < e50[i] and 32 < rs[i] < 50):
-            signals[names[0]][i] = "SHORT"
-
-        # Strategy 2: EMA50/200 trend + RSI
-        if (e50[i] > e200[i] and e20[i - 1] <= e50[i - 1]
-                and e20[i] > e50[i] and 52 < rs[i] < 70):
-            signals[names[1]][i] = "LONG"
-        elif (e50[i] < e200[i] and e20[i - 1] >= e50[i - 1]
-                and e20[i] < e50[i] and 30 < rs[i] < 48):
-            signals[names[1]][i] = "SHORT"
-
-        # Strategy 3: 20-candle breakout
-        prev_high = max(highs[i - 20:i])
-        prev_low = min(lows[i - 20:i])
-
-        if closes[i] > prev_high and closes[i] > e50[i] and rs[i] > 52:
-            signals[names[2]][i] = "LONG"
-        elif closes[i] < prev_low and closes[i] < e50[i] and rs[i] < 48:
-            signals[names[2]][i] = "SHORT"
-
-        # Strategy 4: EMA20/50 pullback
-        if (e20[i] > e50[i] and closes[i - 1] <= e20[i - 1]
-                and closes[i] > e20[i] and 50 < rs[i] < 65):
-            signals[names[3]][i] = "LONG"
-        elif (e20[i] < e50[i] and closes[i - 1] >= e20[i - 1]
-                and closes[i] < e20[i] and 35 < rs[i] < 50):
-            signals[names[3]][i] = "SHORT"
-
-        # Strategy 5: Support/Resistance + Supply/Demand
-        # Levels are calculated only from candles before the current candle.
-        if i < LOOKBACK + 1:
-            continue
-
-        resistance = max(highs[i - LOOKBACK:i])
-        support = min(lows[i - LOOKBACK:i])
 
         zone = ats[i] * ZONE_ATR
         candle_range = highs[i] - lows[i]
@@ -189,85 +168,76 @@ def make_signals(candles):
             continue
 
         body_ratio = abs(closes[i] - opens[i]) / candle_range
-
         bullish = closes[i] > opens[i]
         bearish = closes[i] < opens[i]
 
-        # Support rejection / demand reaction
+        # Levels use only candles before the current candle.
+        support = min(lows[i - LOOKBACK:i])
+        resistance = max(highs[i - LOOKBACK:i])
+
+        # Previous levels for detecting a breakout.
+        old_support = min(lows[i - LOOKBACK - 1:i - 1])
+        old_resistance = max(highs[i - LOOKBACK - 1:i - 1])
+
+        # Detect breakout on the previous closed candle.
+        breakout_up[i - 1] = closes[i - 1] > old_resistance
+        breakout_down[i - 1] = closes[i - 1] < old_support
+
+        # 1. Support bounce: bullish rejection from support.
         support_touch = lows[i] <= support + zone
         support_reclaim = closes[i] > support + zone * 0.25
-
-        bullish_engulfing = (
-            closes[i] > opens[i]
-            and closes[i - 1] < opens[i - 1]
-            and opens[i] <= closes[i - 1]
-            and closes[i] >= opens[i - 1]
-        )
 
         if (
             support_touch
             and support_reclaim
             and bullish
-            and (body_ratio >= MIN_BODY_RATIO or bullish_engulfing)
+            and body_ratio >= MIN_BODY_RATIO
             and closes[i] > e50[i]
             and 45 < rs[i] < 68
         ):
-            signals[names[4]][i] = "LONG"
+            signals["BOUNCE_LONG"][i] = "LONG"
 
-        # Resistance rejection / supply reaction
+        # 2. Resistance bounce: bearish rejection.
         resistance_touch = highs[i] >= resistance - zone
         resistance_reject = closes[i] < resistance - zone * 0.25
-
-        bearish_engulfing = (
-            closes[i] < opens[i]
-            and closes[i - 1] > opens[i - 1]
-            and opens[i] >= closes[i - 1]
-            and closes[i] <= opens[i - 1]
-        )
 
         if (
             resistance_touch
             and resistance_reject
             and bearish
-            and (body_ratio >= MIN_BODY_RATIO or bearish_engulfing)
+            and body_ratio >= MIN_BODY_RATIO
             and closes[i] < e50[i]
             and 32 < rs[i] < 55
         ):
-            signals[names[4]][i] = "SHORT"
+            signals["BOUNCE_SHORT"][i] = "SHORT"
 
-        # Breakout and retest
-        # Check the breakout using only the preceding candle.
-        old_resistance = max(highs[i - LOOKBACK - 1:i - 1])
-        old_support = min(lows[i - LOOKBACK - 1:i - 1])
-
-        # Bullish retest: prior candle closed above resistance;
-        # current candle retests and closes back above it.
+        # 3. Breakout and retest.
+        # Require a prior candle to close outside the previous level.
         if (
-            closes[i - 1] > old_resistance
+            breakout_up[i - 1]
             and lows[i] <= old_resistance + zone
             and closes[i] > old_resistance + zone * 0.25
             and bullish
             and closes[i] > e50[i]
             and rs[i] > 50
         ):
-            signals[names[4]][i] = "LONG"
+            signals["RETEST_LONG"][i] = "LONG"
 
-        # Bearish retest: prior candle closed below support;
-        # current candle retests and closes back below it.
-        elif (
-            closes[i - 1] < old_support
+        if (
+            breakout_down[i - 1]
             and highs[i] >= old_support - zone
             and closes[i] < old_support - zone * 0.25
             and bearish
             and closes[i] < e50[i]
             and rs[i] < 50
         ):
-            signals[names[4]][i] = "SHORT"
+            signals["RETEST_SHORT"][i] = "SHORT"
 
     return opens, highs, lows, closes, ats, signals
 
+
 def test_strategy(name, signals, opens, highs, lows, closes,
-                  ats, start, end):
+                  ats, start, end, side_filter=None):
     balance = START_BALANCE
     peak = balance
     max_dd = 0.0
@@ -277,29 +247,51 @@ def test_strategy(name, signals, opens, highs, lows, closes,
 
     while i < end and balance > 0:
         side = signals[i]
+
         if side not in ("LONG", "SHORT") or not ats[i]:
+            i += 1
+            continue
+
+        if side_filter and side != side_filter:
             i += 1
             continue
 
         entry_i = i + 1
         raw_entry = opens[entry_i]
+
         entry = raw_entry * (
-            1 + SLIPPAGE if side == "LONG" else 1 - SLIPPAGE
+            1 + SLIPPAGE if side == "LONG"
+            else 1 - SLIPPAGE
         )
 
-        distance = ats[i] * ATR_STOP
-        if distance <= 0 or entry <= 0:
+        # Define stop behind the relevant zone.
+        left = max(0, i - LOOKBACK)
+        if side == "LONG":
+            zone_level = min(lows[left:i])
+            stop = zone_level - ats[i] * STOP_BUFFER_ATR
+            distance = entry - stop
+        else:
+            zone_level = max(highs[left:i])
+            stop = zone_level + ats[i] * STOP_BUFFER_ATR
+            distance = stop - entry
+
+        if (
+            distance <= 0
+            or distance < ats[i] * MIN_RISK_ATR
+            or distance > ats[i] * MAX_RISK_ATR
+        ):
             i += 1
             continue
 
-        stop = entry - distance if side == "LONG" else entry + distance
         target = (
             entry + distance * REWARD_R
-            if side == "LONG" else entry - distance * REWARD_R
+            if side == "LONG"
+            else entry - distance * REWARD_R
         )
 
         risk_cash = balance * RISK_PERCENT
         units = risk_cash / distance
+
         if units <= 0:
             break
 
@@ -341,24 +333,32 @@ def test_strategy(name, signals, opens, highs, lows, closes,
         fees = (
             abs(entry * units) + abs(exit_price * units)
         ) * FEE
-        net = gross - fees
 
+        net = gross - fees
         balance = max(0.0, balance + net)
         peak = max(peak, balance)
 
         if peak > 0:
             max_dd = max(
-                max_dd, (peak - balance) / peak * 100
+                max_dd,
+                (peak - balance) / peak * 100
             )
 
-        trades.append(net)
+        trades.append({
+            "net": net,
+            "side": side,
+            "entry_i": entry_i,
+            "exit_i": exit_i
+        })
+
         i = exit_i + 1
 
-    wins = sum(1 for p in trades if p > 0)
-    losses = sum(1 for p in trades if p < 0)
-    gross_profit = sum(p for p in trades if p > 0)
-    gross_loss = -sum(p for p in trades if p < 0)
-    pf = gross_profit / gross_loss if gross_loss else 0.0
+    profits = [t["net"] for t in trades]
+    wins = sum(1 for p in profits if p > 0)
+    losses = sum(1 for p in profits if p < 0)
+    gross_profit = sum(p for p in profits if p > 0)
+    gross_loss = -sum(p for p in profits if p < 0)
+    pf = gross_profit / gross_loss if gross_loss > 0 else 0.0
 
     return {
         "name": name,
@@ -373,15 +373,23 @@ def test_strategy(name, signals, opens, highs, lows, closes,
         "final_balance": balance
     }
 
+
+def print_result(result, label):
+    print(f"--- {label} ---")
+    print(f"Trades: {result['count']}")
+    print(f"Wins: {result['wins']}")
+    print(f"Losses: {result['losses']}")
+    print(f"Win rate: {result['winrate']:.2f}%")
+    print(f"Net P/L: {result['net']:.2f} USDT")
+    print(f"Return: {result['return_pct']:.2f}%")
+    print(f"Profit factor: {result['pf']:.2f}")
+    print(f"Max drawdown: {result['drawdown']:.2f}%")
+    print(f"Final balance: {result['final_balance']:.2f} USDT")
+
+
 def main():
-    print("Starting SOL-USDT-SWAP backtest...")
-
+    print("Starting SOL support/resistance backtest...")
     candles = get_candles()
-
-    if not candles:
-        print("ERROR: No candles were downloaded.")
-        return
-
     print(f"Downloaded candles: {len(candles)}")
 
     opens, highs, lows, closes, ats, signals = make_signals(candles)
@@ -391,38 +399,29 @@ def main():
 
     print(f"Development candles: {split}")
     print(f"Out-of-sample candles: {total - split}")
-    print("\n===== BACKTEST RESULTS =====")
 
     for name, strategy_signals in signals.items():
-        development = test_strategy(
-            name, strategy_signals, opens, highs, lows, closes,
-            ats, 201, split
-        )
+        print(f"\n===== Strategy: {name} =====")
 
-        out_sample = test_strategy(
-            name, strategy_signals, opens, highs, lows, closes,
-            ats, split, total - 1
-        )
+        for side_filter, side_name in [
+            ("LONG", "BUY ONLY"),
+            ("SHORT", "SELL ONLY"),
+            (None, "BOTH SIDES")
+        ]:
+            print(f"\nDirection: {side_name}")
 
-        print(f"\nStrategy: {name}")
+            development = test_strategy(
+                name, strategy_signals, opens, highs, lows,
+                closes, ats, LOOKBACK + 2, split, side_filter
+            )
 
-        print("--- Development (70%) ---")
-        print(f"Trades: {development['count']}")
-        print(f"Win rate: {development['winrate']:.2f}%")
-        print(f"Net P/L: {development['net']:.2f} USDT")
-        print(f"Return: {development['return_pct']:.2f}%")
-        print(f"Profit factor: {development['pf']:.2f}")
-        print(f"Max drawdown: {development['drawdown']:.2f}%")
-        print(f"Final balance: {development['final_balance']:.2f} USDT")
+            out_sample = test_strategy(
+                name, strategy_signals, opens, highs, lows,
+                closes, ats, split, total - 1, side_filter
+            )
 
-        print("--- Out-of-sample (30%) ---")
-        print(f"Trades: {out_sample['count']}")
-        print(f"Win rate: {out_sample['winrate']:.2f}%")
-        print(f"Net P/L: {out_sample['net']:.2f} USDT")
-        print(f"Return: {out_sample['return_pct']:.2f}%")
-        print(f"Profit factor: {out_sample['pf']:.2f}")
-        print(f"Max drawdown: {out_sample['drawdown']:.2f}%")
-        print(f"Final balance: {out_sample['final_balance']:.2f} USDT")
+            print_result(development, "Development (70%)")
+            print_result(out_sample, "Out-of-sample (30%)")
 
     print("\n===== BACKTEST FINISHED =====")
 
