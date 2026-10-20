@@ -259,7 +259,7 @@ def test_strategy(name, signals, opens, highs, lows, closes,
     gross_loss = -sum(p for p in trades if p < 0)
     pf = gross_profit / gross_loss if gross_loss else 0.0
 
-    return {
+        return {
         "name": name,
         "count": len(trades),
         "wins": wins,
@@ -268,4 +268,6 @@ def test_strategy(name, signals, opens, highs, lows, closes,
         "net": balance - START_BALANCE,
         "return_pct": (balance / START_BALANCE - 1) * 100,
         "pf": pf,
-        "drawdown": max
+        "drawdown": max_dd,
+        "final_balance": balance
+    }
