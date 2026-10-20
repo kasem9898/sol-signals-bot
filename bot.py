@@ -1,26 +1,36 @@
 import os
-import time
 import requests
 
-TOKEN = os.environ["TELEGRAM_TOKEN"]
-CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
+TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
+TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
-BINANCE_URL = "https://www.okx.com/api/v5/market/candles"
-TELEGRAM_URL = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-
-last_signal = None
-last_candle = None
+OKX_URL = "https://www.okx.com/api/v5/market/candles"
+TELEGRAM_URL = (
+    f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+)
 
 
 def send_message(message):
-    response = requests.post(TELEGRAM_URL, data={"chat_id": CHAT_ID, "text": message}, timeout=15)
-    print("Telegram response:", response.status_code, response.text)
+    response = requests.post(
+        TELEGRAM_URL,
+        data={
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": message
+        },
+        timeout=15
+    )
+
     response.raise_for_status()
+
+    result = response.json()
+
+    if not result.get("ok"):
+        raise Exception(f"Telegram error: {result}")
 
 
 def ema(values, period):
-    result = values[0]
     alpha = 2 / (period + 1)
+    result = values[0]
 
     for value in values[1:]:
         result = alpha * value + (1 - alpha) * result
@@ -28,11 +38,49 @@ def ema(values, period):
     return result
 
 
-def analyze():
-    global last_signal, last_candle
+def calculate_rsi(closes, period=14):
+    changes = [
+        closes[i] - closes[i - 1]
+        for i in range(len(closes) - period, len(closes))
+    ]
 
+    gains = [max(change, 0) for change in changes]
+    losses = [max(-change, 0) for change in changes]
+
+    avg_gain = sum(gains) / period
+    avg_loss = sum(losses) / period
+
+    if avg_loss == 0:
+        return 100.0
+
+    if avg_gain == 0:
+        return 0.0
+
+    return 100 - (100 / (1 + avg_gain / avg_loss))
+
+
+def calculate_atr(candles, period=14):
+    true_ranges = []
+
+    for i in range(len(candles) - period, len(candles)):
+        high = float(candles[i][2])
+        low = float(candles[i][3])
+        previous_close = float(candles[i - 1][4])
+
+        true_range = max(
+            high - low,
+            abs(high - previous_close),
+            abs(low - previous_close)
+        )
+
+        true_ranges.append(true_range)
+
+    return sum(true_ranges) / period
+
+
+def analyze():
     response = requests.get(
-        BINANCE_URL,
+        OKX_URL,
         params={
             "instId": "SOL-USDT-SWAP",
             "bar": "5m",
@@ -40,77 +88,124 @@ def analyze():
         },
         timeout=15
     )
+
     response.raise_for_status()
     result = response.json()
 
     if result.get("code") != "0":
         raise Exception(f"OKX API error: {result}")
 
-    candles = result["data"]
+    raw_candles = result.get("data", [])
 
-    # نستخدم الشموع المكتملة فقط
-    closed = [candle for candle in candles if candle[8] == "1"]
-
-    if len(closed) < 30:
-        raise Exception("Not enough closed candles")
-
-    # ترتيب الشموع من الأقدم إلى الأحدث
-    closed = list(reversed(closed))
-
-    closes = [float(candle[4]) for candle in closed]
-    candle_time = closed[-1][0]
-    price = closes[-1]
-
-    if candle_time == last_candle:
-        return
-
-    last_candle = candle_time
-
-    ema9 = ema(closes[-60:], 9)
-    ema21 = ema(closes[-60:], 21)
-
-    changes = [
-        closes[i] - closes[i - 1]
-        for i in range(len(closes) - 14, len(closes))
+    # استخدام الشموع المكتملة فقط
+    candles = [
+        candle for candle in raw_candles
+        if candle[8] == "1"
     ]
 
-    gains = [max(change, 0) for change in changes[-14:]]
-    losses = [max(-change, 0) for change in changes[-14:]]
+    # ترتيب الشموع من الأقدم إلى الأحدث
+    candles.reverse()
 
-    avg_gain = sum(gains) / 14
-    avg_loss = sum(losses) / 14
+    if len(candles) < 60:
+        raise Exception("Not enough closed candles")
 
-    if avg_loss == 0:
-        rsi = 100
-    else:
-        rsi = 100 - (100 / (1 + avg_gain / avg_loss))
+    closes = [float(candle[4]) for candle in candles]
+
+    price = closes[-1]
+    candle_time = candles[-1][0]
+
+    # المتوسطات الحالية
+    ema9 = ema(closes[-60:], 9)
+    ema21 = ema(closes[-60:], 21)
+    ema50 = ema(closes[-60:], 50)
+
+    # المتوسطات قبل إغلاق الشمعة الأخيرة
+    previous_closes = closes[-61:-1]
+
+    previous_ema9 = ema(previous_closes, 9)
+    previous_ema21 = ema(previous_closes, 21)
+
+    rsi = calculate_rsi(closes)
+    atr = calculate_atr(candles)
+
+    print(f"Closed candle: {candle_time}")
+    print(f"Price: {price:.4f}")
+    print(f"EMA 9: {ema9:.4f}")
+    print(f"EMA 21: {ema21:.4f}")
+    print(f"EMA 50: {ema50:.4f}")
+    print(f"RSI: {rsi:.2f}")
+    print(f"ATR: {atr:.4f}")
 
     signal = None
 
-    if ema9 > ema21 and 50 < rsi < 70:
-        signal = "LONG 🟢 شراء"
-    elif ema9 < ema21 and 30 < rsi < 50:
-        signal = "SHORT 🔴 بيع"
+    # شراء: تقاطع صاعد مع اتجاه صاعد وزخم مناسب
+    if (
+        previous_ema9 <= previous_ema21
+        and ema9 > ema21
+        and price > ema50
+        and 50 < rsi < 68
+    ):
+        signal = "LONG"
 
-    if signal and signal != last_signal:
-        message = (
-            f"📊 إشارة SOLUSDT Futures\n"
-            f"⏱ الفريم: 5 دقائق\n"
-            f"📍 الإشارة: {signal}\n"
-            f"💵 السعر: {price:.4f}\n"
-            f"RSI: {rsi:.2f}\n"
-            f"EMA 9: {ema9:.4f}\n"
-            f"EMA 21: {ema21:.4f}\n\n"
-            f"⚠️ إشارة فنية وليست ضماناً للربح.\n"
-            f"حدد وقف الخسارة قبل أي صفقة."
-        )
+    # بيع: تقاطع هابط مع اتجاه هابط وزخم مناسب
+    elif (
+        previous_ema9 >= previous_ema21
+        and ema9 < ema21
+        and price < ema50
+        and 32 < rsi < 50
+    ):
+        signal = "SHORT"
 
-        send_message(message)
-        last_signal = signal
-        
-        
-try:
-    analyze()
-except Exception as error:
-    print("Analysis error:", error)
-    raise
+    if signal is None:
+        print("No trading signal on the latest closed candle.")
+        return
+
+    entry = price
+    risk = atr * 1.5
+
+    if risk <= 0:
+        raise Exception("Invalid ATR risk calculation")
+
+    if signal == "LONG":
+        stop_loss = entry - risk
+        target1 = entry + risk
+        target2 = entry + (2 * risk)
+
+        direction = "LONG 🟢 شراء"
+
+    else:
+        stop_loss = entry + risk
+        target1 = entry - risk
+        target2 = entry - (2 * risk)
+
+        direction = "SHORT 🔴 بيع"
+
+    message = (
+        "📊 إشارة SOLUSDT Futures\n"
+        "⏱ الفريم: 5 دقائق\n"
+        f"📍 الاتجاه: {direction}\n"
+        f"💵 سعر الدخول المرجعي: {entry:.4f}\n"
+        f"🛑 وقف الخسارة: {stop_loss:.4f}\n"
+        f"🎯 الهدف الأول: {target1:.4f}\n"
+        f"🎯 الهدف الثاني: {target2:.4f}\n\n"
+        f"📈 EMA 9: {ema9:.4f}\n"
+        f"📉 EMA 21: {ema21:.4f}\n"
+        f"📊 EMA 50: {ema50:.4f}\n"
+        f"RSI: {rsi:.2f}\n"
+        f"ATR: {atr:.4f}\n\n"
+        "⚠️ إشارة فنية تجريبية وليست ضماناً للربح.\n"
+        "سعر الدخول مرجعي وقد يتغير قبل التنفيذ.\n"
+        "تحقق من حجم الصفقة والرافعة والتصفية قبل الدخول."
+    )
+
+    send_message(message)
+
+    print(f"Signal sent successfully: {signal}")
+
+
+if __name__ == "__main__":
+    try:
+        analyze()
+    except Exception as error:
+        print("Analysis error:", error)
+        raise
