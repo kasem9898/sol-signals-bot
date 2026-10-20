@@ -126,14 +126,22 @@ def make_signals(candles):
         "EMA9/21 + EMA50 + RSI",
         "EMA50/200 trend + RSI",
         "20-candle breakout",
-        "EMA20/50 pullback"
+        "EMA20/50 pullback",
+        "Support/Resistance + Supply/Demand"
     ]
+
     signals = {name: [None] * len(candles) for name in names}
+
+    # Parameters for the support/resistance strategy
+    LOOKBACK = 48
+    ZONE_ATR = 0.35
+    MIN_BODY_RATIO = 0.35
 
     for i in range(201, len(candles) - 1):
         if ats[i] is None or ats[i] <= 0 or rs[i] is None:
             continue
 
+        # Strategy 1: EMA9/21 + EMA50 + RSI
         if (e9[i - 1] <= e21[i - 1] and e9[i] > e21[i]
                 and closes[i] > e50[i] and 50 < rs[i] < 68):
             signals[names[0]][i] = "LONG"
@@ -141,6 +149,7 @@ def make_signals(candles):
                 and closes[i] < e50[i] and 32 < rs[i] < 50):
             signals[names[0]][i] = "SHORT"
 
+        # Strategy 2: EMA50/200 trend + RSI
         if (e50[i] > e200[i] and e20[i - 1] <= e50[i - 1]
                 and e20[i] > e50[i] and 52 < rs[i] < 70):
             signals[names[1]][i] = "LONG"
@@ -148,13 +157,16 @@ def make_signals(candles):
                 and e20[i] < e50[i] and 30 < rs[i] < 48):
             signals[names[1]][i] = "SHORT"
 
+        # Strategy 3: 20-candle breakout
         prev_high = max(highs[i - 20:i])
         prev_low = min(lows[i - 20:i])
+
         if closes[i] > prev_high and closes[i] > e50[i] and rs[i] > 52:
             signals[names[2]][i] = "LONG"
         elif closes[i] < prev_low and closes[i] < e50[i] and rs[i] < 48:
             signals[names[2]][i] = "SHORT"
 
+        # Strategy 4: EMA20/50 pullback
         if (e20[i] > e50[i] and closes[i - 1] <= e20[i - 1]
                 and closes[i] > e20[i] and 50 < rs[i] < 65):
             signals[names[3]][i] = "LONG"
@@ -162,8 +174,97 @@ def make_signals(candles):
                 and closes[i] < e20[i] and 35 < rs[i] < 50):
             signals[names[3]][i] = "SHORT"
 
-    return opens, highs, lows, closes, ats, signals
+        # Strategy 5: Support/Resistance + Supply/Demand
+        # Levels are calculated only from candles before the current candle.
+        if i < LOOKBACK + 1:
+            continue
 
+        resistance = max(highs[i - LOOKBACK:i])
+        support = min(lows[i - LOOKBACK:i])
+
+        zone = ats[i] * ZONE_ATR
+        candle_range = highs[i] - lows[i]
+
+        if candle_range <= 0:
+            continue
+
+        body_ratio = abs(closes[i] - opens[i]) / candle_range
+
+        bullish = closes[i] > opens[i]
+        bearish = closes[i] < opens[i]
+
+        # Support rejection / demand reaction
+        support_touch = lows[i] <= support + zone
+        support_reclaim = closes[i] > support + zone * 0.25
+
+        bullish_engulfing = (
+            closes[i] > opens[i]
+            and closes[i - 1] < opens[i - 1]
+            and opens[i] <= closes[i - 1]
+            and closes[i] >= opens[i - 1]
+        )
+
+        if (
+            support_touch
+            and support_reclaim
+            and bullish
+            and (body_ratio >= MIN_BODY_RATIO or bullish_engulfing)
+            and closes[i] > e50[i]
+            and 45 < rs[i] < 68
+        ):
+            signals[names[4]][i] = "LONG"
+
+        # Resistance rejection / supply reaction
+        resistance_touch = highs[i] >= resistance - zone
+        resistance_reject = closes[i] < resistance - zone * 0.25
+
+        bearish_engulfing = (
+            closes[i] < opens[i]
+            and closes[i - 1] > opens[i - 1]
+            and opens[i] >= closes[i - 1]
+            and closes[i] <= opens[i - 1]
+        )
+
+        if (
+            resistance_touch
+            and resistance_reject
+            and bearish
+            and (body_ratio >= MIN_BODY_RATIO or bearish_engulfing)
+            and closes[i] < e50[i]
+            and 32 < rs[i] < 55
+        ):
+            signals[names[4]][i] = "SHORT"
+
+        # Breakout and retest
+        # Check the breakout using only the preceding candle.
+        old_resistance = max(highs[i - LOOKBACK - 1:i - 1])
+        old_support = min(lows[i - LOOKBACK - 1:i - 1])
+
+        # Bullish retest: prior candle closed above resistance;
+        # current candle retests and closes back above it.
+        if (
+            closes[i - 1] > old_resistance
+            and lows[i] <= old_resistance + zone
+            and closes[i] > old_resistance + zone * 0.25
+            and bullish
+            and closes[i] > e50[i]
+            and rs[i] > 50
+        ):
+            signals[names[4]][i] = "LONG"
+
+        # Bearish retest: prior candle closed below support;
+        # current candle retests and closes back below it.
+        elif (
+            closes[i - 1] < old_support
+            and highs[i] >= old_support - zone
+            and closes[i] < old_support - zone * 0.25
+            and bearish
+            and closes[i] < e50[i]
+            and rs[i] < 50
+        ):
+            signals[names[4]][i] = "SHORT"
+
+    return opens, highs, lows, closes, ats, signals
 
 def test_strategy(name, signals, opens, highs, lows, closes,
                   ats, start, end):
