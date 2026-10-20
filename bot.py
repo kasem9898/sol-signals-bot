@@ -13,11 +13,14 @@ last_candle = None
 
 
 def send_message(message):
-    requests.post(
-        TELEGRAM_URL,
-        data={"chat_id": CHAT_ID, "text": message},
-        timeout=15
-    )
+response = requests.post(
+TELEGRAM_URL,
+data={"chat_id": CHAT_ID, "text": message},
+timeout=15
+)
+
+print("Telegram response:", response.status_code, response.text)
+response.raise_for_status()
 
 
 def ema(values, period):
