@@ -197,8 +197,6 @@ def test_strategy(name, signals, opens, highs, lows, closes,
             if side == "LONG" else entry - distance * REWARD_R
         )
 
-        # Simplified linear exposure; actual OKX contract sizing must
-        # be verified against the instrument's contract specifications.
         risk_cash = balance * RISK_PERCENT
         units = risk_cash / distance
         if units <= 0:
@@ -209,8 +207,6 @@ def test_strategy(name, signals, opens, highs, lows, closes,
         last = min(end - 1, entry_i + MAX_HOLD)
 
         for j in range(entry_i, last + 1):
-            # Approximate gap handling: if open crossed the stop,
-            # use the worse opening price before applying slippage.
             if side == "LONG":
                 if opens[j] <= stop:
                     exit_price, exit_i = opens[j], j
@@ -241,14 +237,18 @@ def test_strategy(name, signals, opens, highs, lows, closes,
             exit_price *= 1 + SLIPPAGE
             gross = (entry - exit_price) * units
 
-        fees = (abs(entry * units) + abs(exit_price * units)) * FEE
+        fees = (
+            abs(entry * units) + abs(exit_price * units)
+        ) * FEE
         net = gross - fees
 
-        # Do not allow the simulated account balance to go negative.
         balance = max(0.0, balance + net)
         peak = max(peak, balance)
+
         if peak > 0:
-            max_dd = max(max_dd, (peak - balance) / peak * 100)
+            max_dd = max(
+                max_dd, (peak - balance) / peak * 100
+            )
 
         trades.append(net)
         i = exit_i + 1
@@ -259,7 +259,7 @@ def test_strategy(name, signals, opens, highs, lows, closes,
     gross_loss = -sum(p for p in trades if p < 0)
     pf = gross_profit / gross_loss if gross_loss else 0.0
 
-        return {
+    return {
         "name": name,
         "count": len(trades),
         "wins": wins,
