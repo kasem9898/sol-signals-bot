@@ -112,7 +112,7 @@ def analyze():
         
         
 try:
-analyze()
+    analyze()
 except Exception as error:
-print("Analysis error:", error)
-raise
+    print("Analysis error:", error)
+    raise
