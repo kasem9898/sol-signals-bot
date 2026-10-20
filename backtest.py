@@ -1,429 +1,681 @@
 import time
 import requests
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
-URL = "https://www.okx.com/api/v5/market/history-candles"
+# =========================================================
+# إعدادات الاختبار
+# =========================================================
+
+BASE_URL = "https://www.okx.com"
 SYMBOL = "SOL-USDT-SWAP"
-DAYS = 90
+TIMEFRAME = "5m"
 
 START_BALANCE = 1000.0
 RISK_PERCENT = 0.01
-FEE = 0.0005
-SLIPPAGE = 0.0002
-REWARD_R = 2.0
-MAX_HOLD = 48
+
+FEE_RATE = 0.0005
+SLIPPAGE_RATE = 0.0002
 
 LOOKBACK = 48
 ATR_PERIOD = 14
-ZONE_ATR = 0.35
-STOP_BUFFER_ATR = 0.25
-MIN_BODY_RATIO = 0.35
-MIN_RISK_ATR = 0.50
-MAX_RISK_ATR = 2.50
 
+STOP_BUFFER_ATR = 0.20
+ZONE_ATR = 0.25
+TARGET_R = 2.0
+MAX_HOLD = 48
+
+MIN_STOP_ATR = 0.30
+MAX_STOP_ATR = 3.0
+
+DAYS = 90
+
+
+# =========================================================
+# جلب البيانات التاريخية من OKX
+# =========================================================
 
 def get_candles():
-    start = int(
-        (datetime.now(timezone.utc) - timedelta(days=DAYS)).timestamp()
-        * 1000
-    )
-    data = {}
-    after = None
+    print("Starting support/resistance backtest...")
 
-    for _ in range(320):
+    all_candles = {}
+    before = None
+    now_ms = int(time.time() * 1000)
+    start_ms = now_ms - DAYS * 24 * 60 * 60 * 1000
+
+    while True:
         params = {
             "instId": SYMBOL,
-            "bar": "5m",
-            "limit": "100"
+            "bar": TIMEFRAME,
+            "limit": "100",
         }
 
-        if after:
-            params["after"] = after
+        if before is not None:
+            params["after"] = str(before)
 
-        response = requests.get(URL, params=params, timeout=20)
-        response.raise_for_status()
-        result = response.json()
+        try:
+            response = requests.get(
+                BASE_URL + "/api/v5/market/history-candles",
+                params=params,
+                timeout=20,
+            )
+            response.raise_for_status()
+            result = response.json()
+
+        except Exception as exc:
+            print("Download error:", exc)
+            break
 
         if result.get("code") != "0":
-            raise RuntimeError(result)
+            print("OKX error:", result.get("msg"))
+            break
 
         rows = result.get("data", [])
+
         if not rows:
             break
 
+        oldest_ts = None
+
         for row in rows:
             ts = int(row[0])
-            if ts >= start and row[8] == "1":
-                data[ts] = row
+            oldest_ts = ts if oldest_ts is None else min(
+                oldest_ts, ts
+            )
 
-        oldest = min(int(row[0]) for row in rows)
+            if start_ms <= ts <= now_ms:
+                all_candles[ts] = {
+                    "ts": ts,
+                    "open": float(row[1]),
+                    "high": float(row[2]),
+                    "low": float(row[3]),
+                    "close": float(row[4]),
+                    "volume": float(row[5]),
+                    "confirm": row[8] if len(row) > 8 else "1",
+                }
+
+        if oldest_ts is None or oldest_ts <= start_ms:
+            break
+
+        before = oldest_ts
 
         print(
-            "Candles:", len(data),
+            "Candles downloaded:",
+            len(all_candles),
             "| Oldest UTC:",
             datetime.fromtimestamp(
-                oldest / 1000, timezone.utc
-            ).strftime("%Y-%m-%d %H:%M")
+                oldest_ts / 1000,
+                timezone.utc
+            ).strftime("%Y-%m-%d %H:%M"),
         )
 
-        if oldest <= start:
-            break
+        time.sleep(0.12)
 
-        if after == str(oldest):
-            break
+    candles = sorted(
+        all_candles.values(),
+        key=lambda candle: candle["ts"]
+    )
 
-        after = str(oldest)
-        time.sleep(0.15)
+    # تجاهل الشمعة الأخيرة إذا كانت ما تزال مفتوحة.
+    current_ms = int(time.time() * 1000)
+    interval_ms = 5 * 60 * 1000
 
-    candles = [data[k] for k in sorted(data)]
+    candles = [
+        c for c in candles
+        if c["confirm"] == "1"
+        and c["ts"] + interval_ms <= current_ms
+    ]
 
-    if len(candles) < 3000:
-        raise RuntimeError(
-            f"Insufficient data: {len(candles)} candles"
+    print("Downloaded closed candles:", len(candles))
+
+    if len(candles) > 0:
+        print(
+            "Oldest candle:",
+            datetime.fromtimestamp(
+                candles[0]["ts"] / 1000,
+                timezone.utc
+            ).strftime("%Y-%m-%d %H:%M UTC"),
+        )
+
+        print(
+            "Newest candle:",
+            datetime.fromtimestamp(
+                candles[-1]["ts"] / 1000,
+                timezone.utc
+            ).strftime("%Y-%m-%d %H:%M UTC"),
         )
 
     return candles
 
 
-def ema(values, period):
-    alpha = 2 / (period + 1)
-    out = [values[0]]
+# =========================================================
+# حساب ATR
+# =========================================================
 
-    for value in values[1:]:
-        out.append(
-            alpha * value + (1 - alpha) * out[-1]
+def calculate_atr(candles, period=ATR_PERIOD):
+    values = [None] * len(candles)
+    true_ranges = []
+
+    for i, candle in enumerate(candles):
+        high = candle["high"]
+        low = candle["low"]
+        previous_close = (
+            candles[i - 1]["close"] if i > 0
+            else candle["close"]
         )
 
-    return out
-
-
-def rsi(values, period=14):
-    out = [None] * len(values)
-
-    for i in range(period, len(values)):
-        changes = [
-            values[j] - values[j - 1]
-            for j in range(i - period + 1, i + 1)
-        ]
-
-        gains = sum(max(x, 0) for x in changes) / period
-        losses = sum(max(-x, 0) for x in changes) / period
-
-        if losses == 0:
-            out[i] = 100 if gains else 50
-        else:
-            out[i] = 100 - 100 / (1 + gains / losses)
-
-    return out
-
-
-def atr(highs, lows, closes, period=ATR_PERIOD):
-    ranges = [None]
-    out = [None] * len(closes)
-
-    for i in range(1, len(closes)):
-        ranges.append(max(
-            highs[i] - lows[i],
-            abs(highs[i] - closes[i - 1]),
-            abs(lows[i] - closes[i - 1])
-        ))
-
-    for i in range(period, len(closes)):
-        out[i] = (
-            sum(ranges[i - period + 1:i + 1]) / period
+        tr = max(
+            high - low,
+            abs(high - previous_close),
+            abs(low - previous_close),
         )
 
-    return out
+        true_ranges.append(tr)
 
+        if i >= period - 1:
+            values[i] = sum(
+                true_ranges[i - period + 1:i + 1]
+            ) / period
+
+    return values
+
+
+# =========================================================
+# اكتشاف إشارات الدعم والمقاومة
+#
+# جميع المستويات محسوبة من الشموع السابقة فقط.
+# لا نستخدم بيانات مستقبلية لتوليد الإشارة.
+# =========================================================
 
 def make_signals(candles):
-    opens = [float(c[1]) for c in candles]
-    highs = [float(c[2]) for c in candles]
-    lows = [float(c[3]) for c in candles]
-    closes = [float(c[4]) for c in candles]
+    count = len(candles)
+    atr = calculate_atr(candles)
 
-    e50 = ema(closes, 50)
-    rs = rsi(closes)
-    ats = atr(highs, lows, closes)
-
-    signals = {
-        "BOUNCE_LONG": [None] * len(candles),
-        "BOUNCE_SHORT": [None] * len(candles),
-        "RETEST_LONG": [None] * len(candles),
-        "RETEST_SHORT": [None] * len(candles)
+    strategies = {
+        "BOUNCE_BUY": [None] * count,
+        "BOUNCE_SELL": [None] * count,
+        "BREAKOUT_BUY": [None] * count,
+        "BREAKOUT_SELL": [None] * count,
     }
 
-    # Retest state: a breakout must happen first.
-    breakout_up = [False] * len(candles)
-    breakout_down = [False] * len(candles)
+    diagnostics = {
+        name: {
+            "candidates": 0,
+            "valid": 0,
+            "invalid_stop": 0,
+        }
+        for name in strategies
+    }
 
-    for i in range(LOOKBACK + 2, len(candles) - 1):
-        if ats[i] is None or ats[i] <= 0 or rs[i] is None:
+    for i in range(max(LOOKBACK, ATR_PERIOD) + 1, count):
+        current = candles[i]
+        previous = candles[i - 1]
+
+        current_atr = atr[i]
+
+        if current_atr is None or current_atr <= 0:
             continue
 
-        zone = ats[i] * ZONE_ATR
-        candle_range = highs[i] - lows[i]
+        # المستويات مأخوذة من الشموع السابقة،
+        # دون استخدام الشمعة الحالية.
+        history = candles[i - LOOKBACK:i]
 
-        if candle_range <= 0:
-            continue
+        support = min(c["low"] for c in history)
+        resistance = max(c["high"] for c in history)
 
-        body_ratio = abs(closes[i] - opens[i]) / candle_range
-        bullish = closes[i] > opens[i]
-        bearish = closes[i] < opens[i]
+        zone = current_atr * ZONE_ATR
+        buffer = current_atr * STOP_BUFFER_ATR
 
-        # Levels use only candles before the current candle.
-        support = min(lows[i - LOOKBACK:i])
-        resistance = max(highs[i - LOOKBACK:i])
+        o = current["open"]
+        h = current["high"]
+        l = current["low"]
+        c = current["close"]
 
-        # Previous levels for detecting a breakout.
-        old_support = min(lows[i - LOOKBACK - 1:i - 1])
-        old_resistance = max(highs[i - LOOKBACK - 1:i - 1])
+        previous_close = previous["close"]
 
-        # Detect breakout on the previous closed candle.
-        breakout_up[i - 1] = closes[i - 1] > old_resistance
-        breakout_down[i - 1] = closes[i - 1] < old_support
+        bullish = c > o
+        bearish = c < o
 
-        # 1. Support bounce: bullish rejection from support.
-        support_touch = lows[i] <= support + zone
-        support_reclaim = closes[i] > support + zone * 0.25
+        # -------------------------------------------------
+        # 1. ارتداد من الدعم: شراء
+        # -------------------------------------------------
 
         if (
-            support_touch
-            and support_reclaim
+            l <= support + zone
+            and c > support
             and bullish
-            and body_ratio >= MIN_BODY_RATIO
-            and closes[i] > e50[i]
-            and 45 < rs[i] < 68
         ):
-            signals["BOUNCE_LONG"][i] = "LONG"
+            level = support
+            stop = support - buffer
 
-        # 2. Resistance bounce: bearish rejection.
-        resistance_touch = highs[i] >= resistance - zone
-        resistance_reject = closes[i] < resistance - zone * 0.25
+            diagnostics["BOUNCE_BUY"]["candidates"] += 1
+
+            risk_distance = c - stop
+
+            if (
+                risk_distance >= current_atr * MIN_STOP_ATR
+                and risk_distance <= current_atr * MAX_STOP_ATR
+            ):
+                strategies["BOUNCE_BUY"][i] = {
+                    "side": "long",
+                    "level": level,
+                    "stop": stop,
+                    "atr": current_atr,
+                }
+
+                diagnostics["BOUNCE_BUY"]["valid"] += 1
+            else:
+                diagnostics["BOUNCE_BUY"]["invalid_stop"] += 1
+
+        # -------------------------------------------------
+        # 2. رفض المقاومة: بيع
+        # -------------------------------------------------
 
         if (
-            resistance_touch
-            and resistance_reject
+            h >= resistance - zone
+            and c < resistance
             and bearish
-            and body_ratio >= MIN_BODY_RATIO
-            and closes[i] < e50[i]
-            and 32 < rs[i] < 55
         ):
-            signals["BOUNCE_SHORT"][i] = "SHORT"
+            level = resistance
+            stop = resistance + buffer
 
-        # 3. Breakout and retest.
-        # Require a prior candle to close outside the previous level.
+            diagnostics["BOUNCE_SELL"]["candidates"] += 1
+
+            risk_distance = stop - c
+
+            if (
+                risk_distance >= current_atr * MIN_STOP_ATR
+                and risk_distance <= current_atr * MAX_STOP_ATR
+            ):
+                strategies["BOUNCE_SELL"][i] = {
+                    "side": "short",
+                    "level": level,
+                    "stop": stop,
+                    "atr": current_atr,
+                }
+
+                diagnostics["BOUNCE_SELL"]["valid"] += 1
+            else:
+                diagnostics["BOUNCE_SELL"]["invalid_stop"] += 1
+
+        # -------------------------------------------------
+        # 3. اختراق المقاومة: شراء
+        # -------------------------------------------------
+
         if (
-            breakout_up[i - 1]
-            and lows[i] <= old_resistance + zone
-            and closes[i] > old_resistance + zone * 0.25
+            previous_close <= resistance
+            and c > resistance + buffer
             and bullish
-            and closes[i] > e50[i]
-            and rs[i] > 50
         ):
-            signals["RETEST_LONG"][i] = "LONG"
+            level = resistance
+            stop = resistance - buffer
+
+            diagnostics["BREAKOUT_BUY"]["candidates"] += 1
+
+            risk_distance = c - stop
+
+            if (
+                risk_distance >= current_atr * MIN_STOP_ATR
+                and risk_distance <= current_atr * MAX_STOP_ATR
+            ):
+                strategies["BREAKOUT_BUY"][i] = {
+                    "side": "long",
+                    "level": level,
+                    "stop": stop,
+                    "atr": current_atr,
+                }
+
+                diagnostics["BREAKOUT_BUY"]["valid"] += 1
+            else:
+                diagnostics["BREAKOUT_BUY"]["invalid_stop"] += 1
+
+        # -------------------------------------------------
+        # 4. كسر الدعم: بيع
+        # -------------------------------------------------
 
         if (
-            breakout_down[i - 1]
-            and highs[i] >= old_support - zone
-            and closes[i] < old_support - zone * 0.25
+            previous_close >= support
+            and c < support - buffer
             and bearish
-            and closes[i] < e50[i]
-            and rs[i] < 50
         ):
-            signals["RETEST_SHORT"][i] = "SHORT"
+            level = support
+            stop = support + buffer
 
-    return opens, highs, lows, closes, ats, signals
+            diagnostics["BREAKOUT_SELL"]["candidates"] += 1
+
+            risk_distance = stop - c
+
+            if (
+                risk_distance >= current_atr * MIN_STOP_ATR
+                and risk_distance <= current_atr * MAX_STOP_ATR
+            ):
+                strategies["BREAKOUT_SELL"][i] = {
+                    "side": "short",
+                    "level": level,
+                    "stop": stop,
+                    "atr": current_atr,
+                }
+
+                diagnostics["BREAKOUT_SELL"]["valid"] += 1
+            else:
+                diagnostics["BREAKOUT_SELL"]["invalid_stop"] += 1
+
+    return strategies, diagnostics
 
 
-def test_strategy(name, signals, opens, highs, lows, closes,
-                  ats, start, end, side_filter=None):
+# =========================================================
+# تنفيذ الاختبار التاريخي
+# =========================================================
+
+def backtest(candles, signals, start, end):
     balance = START_BALANCE
-    peak = balance
-    max_dd = 0.0
+    peak_balance = balance
+    max_drawdown = 0.0
+
     trades = []
-    i = start
-    end = min(end, len(closes) - 1)
+    i = max(start, LOOKBACK + 1)
 
-    while i < end and balance > 0:
-        side = signals[i]
+    while i < end:
+        signal = signals[i]
 
-        if side not in ("LONG", "SHORT") or not ats[i]:
+        if signal is None:
             i += 1
             continue
 
-        if side_filter and side != side_filter:
-            i += 1
-            continue
+        # الدخول بسعر افتتاح الشمعة التالية،
+        # وليس بسعر إغلاق شمعة الإشارة.
+        entry_index = i + 1
 
-        entry_i = i + 1
-        raw_entry = opens[entry_i]
-
-        entry = raw_entry * (
-            1 + SLIPPAGE if side == "LONG"
-            else 1 - SLIPPAGE
-        )
-
-        # Define stop behind the relevant zone.
-        left = max(0, i - LOOKBACK)
-        if side == "LONG":
-            zone_level = min(lows[left:i])
-            stop = zone_level - ats[i] * STOP_BUFFER_ATR
-            distance = entry - stop
-        else:
-            zone_level = max(highs[left:i])
-            stop = zone_level + ats[i] * STOP_BUFFER_ATR
-            distance = stop - entry
-
-        if (
-            distance <= 0
-            or distance < ats[i] * MIN_RISK_ATR
-            or distance > ats[i] * MAX_RISK_ATR
-        ):
-            i += 1
-            continue
-
-        target = (
-            entry + distance * REWARD_R
-            if side == "LONG"
-            else entry - distance * REWARD_R
-        )
-
-        risk_cash = balance * RISK_PERCENT
-        units = risk_cash / distance
-
-        if units <= 0:
+        if entry_index >= end:
             break
 
-        exit_price = closes[entry_i]
-        exit_i = entry_i
-        last = min(end - 1, entry_i + MAX_HOLD)
+        side = signal["side"]
+        raw_entry = candles[entry_index]["open"]
 
-        for j in range(entry_i, last + 1):
-            if side == "LONG":
-                if opens[j] <= stop:
-                    exit_price, exit_i = opens[j], j
-                    break
-                if lows[j] <= stop:
-                    exit_price, exit_i = stop, j
-                    break
-                if highs[j] >= target:
-                    exit_price, exit_i = target, j
-                    break
-            else:
-                if opens[j] >= stop:
-                    exit_price, exit_i = opens[j], j
-                    break
-                if highs[j] >= stop:
-                    exit_price, exit_i = stop, j
-                    break
-                if lows[j] <= target:
-                    exit_price, exit_i = target, j
-                    break
+        if side == "long":
+            entry = raw_entry * (1 + SLIPPAGE_RATE)
+            stop = signal["stop"]
 
-            exit_price, exit_i = closes[j], j
+            risk_distance = entry - stop
 
-        if side == "LONG":
-            exit_price *= 1 - SLIPPAGE
-            gross = (exit_price - entry) * units
+            if risk_distance <= 0:
+                i += 1
+                continue
+
+            target = entry + risk_distance * TARGET_R
+
         else:
-            exit_price *= 1 + SLIPPAGE
-            gross = (entry - exit_price) * units
+            entry = raw_entry * (1 - SLIPPAGE_RATE)
+            stop = signal["stop"]
 
-        fees = (
-            abs(entry * units) + abs(exit_price * units)
-        ) * FEE
+            risk_distance = stop - entry
 
-        net = gross - fees
-        balance = max(0.0, balance + net)
-        peak = max(peak, balance)
+            if risk_distance <= 0:
+                i += 1
+                continue
 
-        if peak > 0:
-            max_dd = max(
-                max_dd,
-                (peak - balance) / peak * 100
-            )
+            target = entry - risk_distance * TARGET_R
+
+        risk_cash = balance * RISK_PERCENT
+
+        # تقدير حجم المركز. هذا نموذج تقريبي لعقد خطي،
+        # وليس حسابًا دقيقًا لحجم عقود OKX أو الرافعة.
+        units = risk_cash / risk_distance
+
+        exit_price = None
+        exit_index = None
+        exit_reason = None
+
+        last_index = min(entry_index + MAX_HOLD, end - 1)
+
+        for j in range(entry_index, last_index + 1):
+            candle = candles[j]
+
+            if side == "long":
+                # إذا تجاوز الافتتاح وقف الخسارة،
+                # نفترض التنفيذ عند الافتتاح الأسوأ.
+                if candle["open"] <= stop:
+                    exit_price = candle["open"] * (
+                        1 - SLIPPAGE_RATE
+                    )
+                    exit_reason = "STOP_GAP"
+                    exit_index = j
+                    break
+
+                if candle["open"] >= target:
+                    exit_price = candle["open"] * (
+                        1 - SLIPPAGE_RATE
+                    )
+                    exit_reason = "TARGET_GAP"
+                    exit_index = j
+                    break
+
+                hit_stop = candle["low"] <= stop
+                hit_target = candle["high"] >= target
+
+                # إذا لمس السعر الهدف والوقف في الشمعة
+                # نفسها، نحتسب الوقف أولًا بحذر.
+                if hit_stop:
+                    exit_price = stop * (
+                        1 - SLIPPAGE_RATE
+                    )
+                    exit_reason = "STOP"
+                    exit_index = j
+                    break
+
+                if hit_target:
+                    exit_price = target * (
+                        1 - SLIPPAGE_RATE
+                    )
+                    exit_reason = "TARGET"
+                    exit_index = j
+                    break
+
+            else:
+                if candle["open"] >= stop:
+                    exit_price = candle["open"] * (
+                        1 + SLIPPAGE_RATE
+                    )
+                    exit_reason = "STOP_GAP"
+                    exit_index = j
+                    break
+
+                if candle["open"] <= target:
+                    exit_price = candle["open"] * (
+                        1 + SLIPPAGE_RATE
+                    )
+                    exit_reason = "TARGET_GAP"
+                    exit_index = j
+                    break
+
+                hit_stop = candle["high"] >= stop
+                hit_target = candle["low"] <= target
+
+                if hit_stop:
+                    exit_price = stop * (
+                        1 + SLIPPAGE_RATE
+                    )
+                    exit_reason = "STOP"
+                    exit_index = j
+                    break
+
+                if hit_target:
+                    exit_price = target * (
+                        1 + SLIPPAGE_RATE
+                    )
+                    exit_reason = "TARGET"
+                    exit_index = j
+                    break
+
+        # إذا لم يصل السعر إلى الوقف أو الهدف.
+        if exit_price is None:
+            exit_index = last_index
+            close_price = candles[exit_index]["close"]
+
+            if side == "long":
+                exit_price = close_price * (
+                    1 - SLIPPAGE_RATE
+                )
+            else:
+                exit_price = close_price * (
+                    1 + SLIPPAGE_RATE
+                )
+
+            exit_reason = "TIME_EXIT"
+
+        if side == "long":
+            gross_pnl = units * (exit_price - entry)
+        else:
+            gross_pnl = units * (entry - exit_price)
+
+        entry_fee = units * entry * FEE_RATE
+        exit_fee = units * exit_price * FEE_RATE
+
+        net_pnl = gross_pnl - entry_fee - exit_fee
+
+        balance += net_pnl
+
+        peak_balance = max(peak_balance, balance)
+
+        if peak_balance > 0:
+            drawdown = (
+                (peak_balance - balance) / peak_balance
+            ) * 100
+            max_drawdown = max(max_drawdown, drawdown)
 
         trades.append({
-            "net": net,
             "side": side,
-            "entry_i": entry_i,
-            "exit_i": exit_i
+            "entry": entry,
+            "exit": exit_price,
+            "pnl": net_pnl,
+            "reason": exit_reason,
+            "entry_index": entry_index,
+            "exit_index": exit_index,
         })
 
-        i = exit_i + 1
+        # منع الصفقات المتداخلة في الاختبار.
+        i = exit_index + 1
 
-    profits = [t["net"] for t in trades]
-    wins = sum(1 for p in profits if p > 0)
-    losses = sum(1 for p in profits if p < 0)
-    gross_profit = sum(p for p in profits if p > 0)
-    gross_loss = -sum(p for p in profits if p < 0)
-    pf = gross_profit / gross_loss if gross_loss > 0 else 0.0
+        if balance <= 0:
+            break
 
     return {
-        "name": name,
-        "count": len(trades),
-        "wins": wins,
-        "losses": losses,
-        "winrate": wins / len(trades) * 100 if trades else 0,
+        "trades": trades,
+        "balance": balance,
         "net": balance - START_BALANCE,
-        "return_pct": (balance / START_BALANCE - 1) * 100,
-        "pf": pf,
-        "drawdown": max_dd,
-        "final_balance": balance
+        "drawdown": max_drawdown,
     }
 
 
-def print_result(result, label):
-    print(f"--- {label} ---")
-    print(f"Trades: {result['count']}")
-    print(f"Wins: {result['wins']}")
-    print(f"Losses: {result['losses']}")
-    print(f"Win rate: {result['winrate']:.2f}%")
-    print(f"Net P/L: {result['net']:.2f} USDT")
-    print(f"Return: {result['return_pct']:.2f}%")
-    print(f"Profit factor: {result['pf']:.2f}")
-    print(f"Max drawdown: {result['drawdown']:.2f}%")
-    print(f"Final balance: {result['final_balance']:.2f} USDT")
+# =========================================================
+# طباعة النتائج
+# =========================================================
 
+def print_results(name, result):
+    trades = result["trades"]
+
+    wins = [t for t in trades if t["pnl"] > 0]
+    losses = [t for t in trades if t["pnl"] <= 0]
+
+    gross_profit = sum(t["pnl"] for t in wins)
+    gross_loss = abs(sum(t["pnl"] for t in losses))
+
+    if gross_loss > 0:
+        profit_factor = gross_profit / gross_loss
+    elif gross_profit > 0:
+        profit_factor = float("inf")
+    else:
+        profit_factor = 0.0
+
+    win_rate = (
+        len(wins) / len(trades) * 100
+        if trades else 0.0
+    )
+
+    print(f"\n--- {name} ---")
+    print("Trades:", len(trades))
+    print("Wins:", len(wins))
+    print("Losses:", len(losses))
+    print(f"Win rate: {win_rate:.2f}%")
+    print(f"Gross profit: {gross_profit:.2f} USDT")
+    print(f"Gross loss: {gross_loss:.2f} USDT")
+
+    if profit_factor == float("inf"):
+        print("Profit factor: Infinite (no losing trades)")
+    else:
+        print(f"Profit factor: {profit_factor:.2f}")
+
+    print(f"Net P/L: {result['net']:.2f} USDT")
+    print(
+        f"Return: {result['net'] / START_BALANCE * 100:.2f}%"
+    )
+    print(f"Max drawdown: {result['drawdown']:.2f}%")
+    print(f"Final balance: {result['balance']:.2f} USDT")
+
+    reasons = {}
+
+    for trade in trades:
+        reasons[trade["reason"]] = (
+            reasons.get(trade["reason"], 0) + 1
+        )
+
+    print("Exit reasons:", reasons)
+
+
+# =========================================================
+# التشغيل الرئيسي
+# =========================================================
 
 def main():
-    print("Starting SOL support/resistance backtest...")
     candles = get_candles()
-    print(f"Downloaded candles: {len(candles)}")
 
-    opens, highs, lows, closes, ats, signals = make_signals(candles)
+    if len(candles) < 1000:
+        print(
+            "ERROR: Not enough historical candles. "
+            "Check the OKX API response."
+        )
+        return
 
-    total = len(candles)
-    split = int(total * 0.70)
+    print("\nGenerating support/resistance signals...")
 
-    print(f"Development candles: {split}")
-    print(f"Out-of-sample candles: {total - split}")
+    strategies, diagnostics = make_signals(candles)
 
-    for name, strategy_signals in signals.items():
-        print(f"\n===== Strategy: {name} =====")
+    split = int(len(candles) * 0.70)
 
-        for side_filter, side_name in [
-            ("LONG", "BUY ONLY"),
-            ("SHORT", "SELL ONLY"),
-            (None, "BOTH SIDES")
-        ]:
-            print(f"\nDirection: {side_name}")
+    print("Total candles:", len(candles))
+    print("Development candles:", split)
+    print("Out-of-sample candles:", len(candles) - split)
 
-            development = test_strategy(
-                name, strategy_signals, opens, highs, lows,
-                closes, ats, LOOKBACK + 2, split, side_filter
-            )
+    print("\n===== SIGNAL DIAGNOSTICS =====")
 
-            out_sample = test_strategy(
-                name, strategy_signals, opens, highs, lows,
-                closes, ats, split, total - 1, side_filter
-            )
+    for name, stats in diagnostics.items():
+        print(f"\n{name}")
+        print("Candidates:", stats["candidates"])
+        print("Valid signals:", stats["valid"])
+        print("Rejected stop distance:", stats["invalid_stop"])
 
-            print_result(development, "Development (70%)")
-            print_result(out_sample, "Out-of-sample (30%)")
+    print("\n===== BACKTEST RESULTS =====")
 
-    print("\n===== BACKTEST FINISHED =====")
+    for name, signals in strategies.items():
+        print("\n" + "=" * 55)
+        print("STRATEGY:", name)
+        print("=" * 55)
+
+        development = backtest(
+            candles,
+            signals,
+            start=LOOKBACK + 1,
+            end=split,
+        )
+
+        out_of_sample = backtest(
+            candles,
+            signals,
+            start=split,
+            end=len(candles) - 1,
+        )
+
+        print_results("DEVELOPMENT - 70%", development)
+        print_results("OUT OF SAMPLE - 30%", out_of_sample)
 
 
 if __name__ == "__main__":
