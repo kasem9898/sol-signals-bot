@@ -271,3 +271,6 @@ def test_strategy(name, signals, opens, highs, lows, closes,
         "drawdown": max_dd,
         "final_balance": balance
     }
+
+if __name__ == "__main__":
+    main()
