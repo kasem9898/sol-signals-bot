@@ -3,85 +3,85 @@ import requests
 from datetime import datetime, timezone
 
 # =========================================================
-# إعدادات الاختبار
+# 1-minute momentum backtest for SOL-USDT-SWAP on OKX
+# This script only downloads data and runs a historical test.
+# It does NOT place real orders and does not modify bot.py.
 # =========================================================
 
 BASE_URL = "https://www.okx.com"
 SYMBOL = "SOL-USDT-SWAP"
-TIMEFRAME = "5m"
+TIMEFRAME = "1m"
+INTERVAL_MS = 60_000
 
 START_BALANCE = 1000.0
 RISK_PERCENT = 0.01
 
-FEE_RATE = 0.0005
-SLIPPAGE_RATE = 0.0002
+# Illustrative assumptions; replace with your actual account fee tier.
+FEE_RATE = 0.0005          # per side, as a fraction of traded notional
+SLIPPAGE_RATE = 0.0002     # per side, as a fraction of price
+MAX_NOTIONAL_MULTIPLE = 1.0  # cap position notional at 1x current balance
 
-LOOKBACK = 48
 ATR_PERIOD = 14
-
-STOP_BUFFER_ATR = 0.20
-ZONE_ATR = 0.25
-TARGET_R = 2.0
-MAX_HOLD = 48
-
-MIN_STOP_ATR = 0.30
-MAX_STOP_ATR = 3.0
-
+VOLUME_PERIOD = 20
+EMA_FAST = 9
+EMA_SLOW = 21
+MAX_HOLD = 10              # exit after at most 10 one-minute candles
+STOP_ATR = 1.2
+TARGET_R = 1.5
 DAYS = 90
+TRAIN_FRACTION = 0.70
+
+# Compare a small, predefined set of momentum thresholds.
+# Do not pick a configuration using the out-of-sample data and then
+# treat that same data as a fresh, unbiased test.
+CONFIGS = [
+    {"name": "Mild",   "mom1": 0.0005, "mom3": 0.0012, "vol_mult": 1.2, "body_min": 0.45},
+    {"name": "Base",   "mom1": 0.0008, "mom3": 0.0018, "vol_mult": 1.2, "body_min": 0.45},
+    {"name": "Strict", "mom1": 0.0010, "mom3": 0.0025, "vol_mult": 1.3, "body_min": 0.50},
+]
 
 
-# =========================================================
-# جلب البيانات التاريخية من OKX
-# =========================================================
+def utc_string(ts_ms):
+    return datetime.fromtimestamp(ts_ms / 1000, timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
 
 def get_candles():
-    print("Starting support/resistance backtest...")
-
+    print("Downloading OKX 1-minute historical candles...")
     all_candles = {}
     before = None
     now_ms = int(time.time() * 1000)
     start_ms = now_ms - DAYS * 24 * 60 * 60 * 1000
+    session = requests.Session()
 
     while True:
-        params = {
-            "instId": SYMBOL,
-            "bar": TIMEFRAME,
-            "limit": "100",
-        }
-
+        params = {"instId": SYMBOL, "bar": TIMEFRAME, "limit": "300"}
         if before is not None:
             params["after"] = str(before)
 
         try:
-            response = requests.get(
+            response = session.get(
                 BASE_URL + "/api/v5/market/history-candles",
                 params=params,
                 timeout=20,
             )
             response.raise_for_status()
-            result = response.json()
-
+            payload = response.json()
         except Exception as exc:
             print("Download error:", exc)
             break
 
-        if result.get("code") != "0":
-            print("OKX error:", result.get("msg"))
+        if payload.get("code") != "0":
+            print("OKX API error:", payload.get("msg", "unknown error"))
             break
 
-        rows = result.get("data", [])
-
+        rows = payload.get("data", [])
         if not rows:
             break
 
         oldest_ts = None
-
         for row in rows:
             ts = int(row[0])
-            oldest_ts = ts if oldest_ts is None else min(
-                oldest_ts, ts
-            )
-
+            oldest_ts = ts if oldest_ts is None else min(oldest_ts, ts)
             if start_ms <= ts <= now_ms:
                 all_candles[ts] = {
                     "ts": ts,
@@ -93,589 +93,316 @@ def get_candles():
                     "confirm": row[8] if len(row) > 8 else "1",
                 }
 
-        if oldest_ts is None or oldest_ts <= start_ms:
+        if oldest_ts is None or oldest_ts <= start_ms or oldest_ts == before:
             break
 
         before = oldest_ts
+        if len(all_candles) % 3000 < 300:
+            print("Candles collected:", len(all_candles), "| oldest:", utc_string(oldest_ts))
+        time.sleep(0.15)
 
-        print(
-            "Candles downloaded:",
-            len(all_candles),
-            "| Oldest UTC:",
-            datetime.fromtimestamp(
-                oldest_ts / 1000,
-                timezone.utc
-            ).strftime("%Y-%m-%d %H:%M"),
-        )
-
-        time.sleep(0.12)
-
-    candles = sorted(
-        all_candles.values(),
-        key=lambda candle: candle["ts"]
-    )
-
-    # تجاهل الشمعة الأخيرة إذا كانت ما تزال مفتوحة.
+    candles = sorted(all_candles.values(), key=lambda x: x["ts"])
     current_ms = int(time.time() * 1000)
-    interval_ms = 5 * 60 * 1000
-
     candles = [
         c for c in candles
-        if c["confirm"] == "1"
-        and c["ts"] + interval_ms <= current_ms
+        if c["confirm"] == "1" and c["ts"] + INTERVAL_MS <= current_ms
     ]
 
-    print("Downloaded closed candles:", len(candles))
+    # Remove duplicate timestamps and any gaps are left visible for diagnostics.
+    unique = []
+    seen = set()
+    for c in candles:
+        if c["ts"] not in seen:
+            unique.append(c)
+            seen.add(c["ts"])
+    candles = unique
 
-    if len(candles) > 0:
-        print(
-            "Oldest candle:",
-            datetime.fromtimestamp(
-                candles[0]["ts"] / 1000,
-                timezone.utc
-            ).strftime("%Y-%m-%d %H:%M UTC"),
+    print("Closed candles:", len(candles))
+    if candles:
+        print("Range:", utc_string(candles[0]["ts"]), "to", utc_string(candles[-1]["ts"]))
+        gaps = sum(
+            1 for i in range(1, len(candles))
+            if candles[i]["ts"] - candles[i - 1]["ts"] > INTERVAL_MS
         )
-
-        print(
-            "Newest candle:",
-            datetime.fromtimestamp(
-                candles[-1]["ts"] / 1000,
-                timezone.utc
-            ).strftime("%Y-%m-%d %H:%M UTC"),
-        )
-
+        print("Time gaps larger than 1 minute:", gaps)
     return candles
 
 
-# =========================================================
-# حساب ATR
-# =========================================================
+def calculate_indicators(candles):
+    n = len(candles)
+    close = [c["close"] for c in candles]
+    high = [c["high"] for c in candles]
+    low = [c["low"] for c in candles]
+    volume = [c["volume"] for c in candles]
 
-def calculate_atr(candles, period=ATR_PERIOD):
-    values = [None] * len(candles)
-    true_ranges = []
+    atr = [None] * n
+    ema_fast = [None] * n
+    ema_slow = [None] * n
+    mom1 = [None] * n
+    mom3 = [None] * n
+    prior_volume_avg = [None] * n
+    body_ratio = [None] * n
+    close_location = [None] * n
 
-    for i, candle in enumerate(candles):
-        high = candle["high"]
-        low = candle["low"]
-        previous_close = (
-            candles[i - 1]["close"] if i > 0
-            else candle["close"]
-        )
+    tr_values = []
+    alpha_fast = 2 / (EMA_FAST + 1)
+    alpha_slow = 2 / (EMA_SLOW + 1)
+    ef = es = None
 
-        tr = max(
-            high - low,
-            abs(high - previous_close),
-            abs(low - previous_close),
-        )
+    for i in range(n):
+        prev_close = close[i - 1] if i else close[i]
+        tr_values.append(max(
+            high[i] - low[i],
+            abs(high[i] - prev_close),
+            abs(low[i] - prev_close),
+        ))
 
-        true_ranges.append(tr)
+        if i == 0:
+            ef = es = close[i]
+        else:
+            ef = alpha_fast * close[i] + (1 - alpha_fast) * ef
+            es = alpha_slow * close[i] + (1 - alpha_slow) * es
+        ema_fast[i] = ef
+        ema_slow[i] = es
 
-        if i >= period - 1:
-            values[i] = sum(
-                true_ranges[i - period + 1:i + 1]
-            ) / period
+        if i >= ATR_PERIOD - 1:
+            atr[i] = sum(tr_values[i - ATR_PERIOD + 1:i + 1]) / ATR_PERIOD
 
-    return values
+        if i >= 1 and close[i - 1] != 0:
+            mom1[i] = close[i] / close[i - 1] - 1
+        if i >= 3 and close[i - 3] != 0:
+            mom3[i] = close[i] / close[i - 3] - 1
 
+        # Average of previous candles only, excluding the current candle.
+        if i >= VOLUME_PERIOD:
+            prior_volume_avg[i] = sum(volume[i - VOLUME_PERIOD:i]) / VOLUME_PERIOD
 
-# =========================================================
-# اكتشاف إشارات الدعم والمقاومة
-#
-# جميع المستويات محسوبة من الشموع السابقة فقط.
-# لا نستخدم بيانات مستقبلية لتوليد الإشارة.
-# =========================================================
+        candle_range = high[i] - low[i]
+        if candle_range > 0:
+            body_ratio[i] = abs(close[i] - candles[i]["open"]) / candle_range
+            close_location[i] = (close[i] - low[i]) / candle_range
 
-def make_signals(candles):
-    count = len(candles)
-    atr = calculate_atr(candles)
-
-    strategies = {
-        "BOUNCE_BUY": [None] * count,
-        "BOUNCE_SELL": [None] * count,
-        "BREAKOUT_BUY": [None] * count,
-        "BREAKOUT_SELL": [None] * count,
+    return {
+        "atr": atr, "ema_fast": ema_fast, "ema_slow": ema_slow,
+        "mom1": mom1, "mom3": mom3, "prior_volume_avg": prior_volume_avg,
+        "body_ratio": body_ratio, "close_location": close_location,
     }
 
-    diagnostics = {
-        name: {
-            "candidates": 0,
-            "valid": 0,
-            "invalid_stop": 0,
-        }
-        for name in strategies
-    }
 
-    for i in range(max(LOOKBACK, ATR_PERIOD) + 1, count):
-        current = candles[i]
-        previous = candles[i - 1]
-
-        current_atr = atr[i]
-
-        if current_atr is None or current_atr <= 0:
+def make_signals(candles, ind, cfg):
+    signals = [None] * len(candles)
+    for i in range(max(ATR_PERIOD, VOLUME_PERIOD, 3), len(candles)):
+        atr = ind["atr"][i]
+        avg_vol = ind["prior_volume_avg"][i]
+        m1, m3 = ind["mom1"][i], ind["mom3"][i]
+        body = ind["body_ratio"][i]
+        loc = ind["close_location"][i]
+        if (atr is None or atr <= 0 or avg_vol is None or avg_vol <= 0
+                or m1 is None or m3 is None or body is None or loc is None):
             continue
 
-        # المستويات مأخوذة من الشموع السابقة،
-        # دون استخدام الشمعة الحالية.
-        history = candles[i - LOOKBACK:i]
+        c = candles[i]
+        vol_ok = c["volume"] >= avg_vol * cfg["vol_mult"]
+        body_ok = body >= cfg["body_min"]
+        bullish = c["close"] > c["open"]
+        bearish = c["close"] < c["open"]
+        trend_up = ind["ema_fast"][i] > ind["ema_slow"][i]
+        trend_down = ind["ema_fast"][i] < ind["ema_slow"][i]
 
-        support = min(c["low"] for c in history)
-        resistance = max(c["high"] for c in history)
+        if (m1 >= cfg["mom1"] and m3 >= cfg["mom3"] and vol_ok
+                and body_ok and loc >= 0.70 and bullish and trend_up):
+            signals[i] = {"side": "long", "atr": atr}
+        elif (m1 <= -cfg["mom1"] and m3 <= -cfg["mom3"] and vol_ok
+                and body_ok and loc <= 0.30 and bearish and trend_down):
+            signals[i] = {"side": "short", "atr": atr}
+    return signals
 
-        zone = current_atr * ZONE_ATR
-        buffer = current_atr * STOP_BUFFER_ATR
-
-        o = current["open"]
-        h = current["high"]
-        l = current["low"]
-        c = current["close"]
-
-        previous_close = previous["close"]
-
-        bullish = c > o
-        bearish = c < o
-
-        # -------------------------------------------------
-        # 1. ارتداد من الدعم: شراء
-        # -------------------------------------------------
-
-        if (
-            l <= support + zone
-            and c > support
-            and bullish
-        ):
-            level = support
-            stop = support - buffer
-
-            diagnostics["BOUNCE_BUY"]["candidates"] += 1
-
-            risk_distance = c - stop
-
-            if (
-                risk_distance >= current_atr * MIN_STOP_ATR
-                and risk_distance <= current_atr * MAX_STOP_ATR
-            ):
-                strategies["BOUNCE_BUY"][i] = {
-                    "side": "long",
-                    "level": level,
-                    "stop": stop,
-                    "atr": current_atr,
-                }
-
-                diagnostics["BOUNCE_BUY"]["valid"] += 1
-            else:
-                diagnostics["BOUNCE_BUY"]["invalid_stop"] += 1
-
-        # -------------------------------------------------
-        # 2. رفض المقاومة: بيع
-        # -------------------------------------------------
-
-        if (
-            h >= resistance - zone
-            and c < resistance
-            and bearish
-        ):
-            level = resistance
-            stop = resistance + buffer
-
-            diagnostics["BOUNCE_SELL"]["candidates"] += 1
-
-            risk_distance = stop - c
-
-            if (
-                risk_distance >= current_atr * MIN_STOP_ATR
-                and risk_distance <= current_atr * MAX_STOP_ATR
-            ):
-                strategies["BOUNCE_SELL"][i] = {
-                    "side": "short",
-                    "level": level,
-                    "stop": stop,
-                    "atr": current_atr,
-                }
-
-                diagnostics["BOUNCE_SELL"]["valid"] += 1
-            else:
-                diagnostics["BOUNCE_SELL"]["invalid_stop"] += 1
-
-        # -------------------------------------------------
-        # 3. اختراق المقاومة: شراء
-        # -------------------------------------------------
-
-        if (
-            previous_close <= resistance
-            and c > resistance + buffer
-            and bullish
-        ):
-            level = resistance
-            stop = resistance - buffer
-
-            diagnostics["BREAKOUT_BUY"]["candidates"] += 1
-
-            risk_distance = c - stop
-
-            if (
-                risk_distance >= current_atr * MIN_STOP_ATR
-                and risk_distance <= current_atr * MAX_STOP_ATR
-            ):
-                strategies["BREAKOUT_BUY"][i] = {
-                    "side": "long",
-                    "level": level,
-                    "stop": stop,
-                    "atr": current_atr,
-                }
-
-                diagnostics["BREAKOUT_BUY"]["valid"] += 1
-            else:
-                diagnostics["BREAKOUT_BUY"]["invalid_stop"] += 1
-
-        # -------------------------------------------------
-        # 4. كسر الدعم: بيع
-        # -------------------------------------------------
-
-        if (
-            previous_close >= support
-            and c < support - buffer
-            and bearish
-        ):
-            level = support
-            stop = support + buffer
-
-            diagnostics["BREAKOUT_SELL"]["candidates"] += 1
-
-            risk_distance = stop - c
-
-            if (
-                risk_distance >= current_atr * MIN_STOP_ATR
-                and risk_distance <= current_atr * MAX_STOP_ATR
-            ):
-                strategies["BREAKOUT_SELL"][i] = {
-                    "side": "short",
-                    "level": level,
-                    "stop": stop,
-                    "atr": current_atr,
-                }
-
-                diagnostics["BREAKOUT_SELL"]["valid"] += 1
-            else:
-                diagnostics["BREAKOUT_SELL"]["invalid_stop"] += 1
-
-    return strategies, diagnostics
-
-
-# =========================================================
-# تنفيذ الاختبار التاريخي
-# =========================================================
 
 def backtest(candles, signals, start, end):
     balance = START_BALANCE
-    peak_balance = balance
-    max_drawdown = 0.0
-
+    peak = balance
+    max_dd = 0.0
     trades = []
-    i = max(start, LOOKBACK + 1)
+    i = max(start, ATR_PERIOD, VOLUME_PERIOD) 
 
-    while i < end:
-        signal = signals[i]
-
-        if signal is None:
+    while i < end - 1:
+        sig = signals[i]
+        if sig is None:
             i += 1
             continue
 
-        # الدخول بسعر افتتاح الشمعة التالية،
-        # وليس بسعر إغلاق شمعة الإشارة.
-        entry_index = i + 1
-
-        if entry_index >= end:
+        entry_i = i + 1
+        if entry_i >= end:
             break
 
-        side = signal["side"]
-        raw_entry = candles[entry_index]["open"]
+        side = sig["side"]
+        raw_entry = candles[entry_i]["open"]
+        entry = raw_entry * (1 + SLIPPAGE_RATE if side == "long" else 1 - SLIPPAGE_RATE)
+        stop_distance = sig["atr"] * STOP_ATR
+        if stop_distance <= 0:
+            i += 1
+            continue
 
         if side == "long":
-            entry = raw_entry * (1 + SLIPPAGE_RATE)
-            stop = signal["stop"]
-
-            risk_distance = entry - stop
-
-            if risk_distance <= 0:
-                i += 1
-                continue
-
-            target = entry + risk_distance * TARGET_R
-
+            stop = entry - stop_distance
+            target = entry + stop_distance * TARGET_R
         else:
-            entry = raw_entry * (1 - SLIPPAGE_RATE)
-            stop = signal["stop"]
+            stop = entry + stop_distance
+            target = entry - stop_distance * TARGET_R
 
-            risk_distance = stop - entry
-
-            if risk_distance <= 0:
-                i += 1
-                continue
-
-            target = entry - risk_distance * TARGET_R
-
-        risk_cash = balance * RISK_PERCENT
-
-        # تقدير حجم المركز. هذا نموذج تقريبي لعقد خطي،
-        # وليس حسابًا دقيقًا لحجم عقود OKX أو الرافعة.
-        units = risk_cash / risk_distance
+        risk_cash = max(0.0, balance) * RISK_PERCENT
+        units_by_risk = risk_cash / stop_distance
+        units_by_notional = max(0.0, balance) * MAX_NOTIONAL_MULTIPLE / entry
+        units = min(units_by_risk, units_by_notional)
+        if units <= 0:
+            break
 
         exit_price = None
-        exit_index = None
         exit_reason = None
+        exit_i = None
+        last_i = min(entry_i + MAX_HOLD - 1, end - 1)
 
-        last_index = min(entry_index + MAX_HOLD, end - 1)
-
-        for j in range(entry_index, last_index + 1):
+        for j in range(entry_i, last_i + 1):
             candle = candles[j]
-
             if side == "long":
-                # إذا تجاوز الافتتاح وقف الخسارة،
-                # نفترض التنفيذ عند الافتتاح الأسوأ.
+                # Conservative gap handling; stop wins if both levels are touched.
                 if candle["open"] <= stop:
-                    exit_price = candle["open"] * (
-                        1 - SLIPPAGE_RATE
-                    )
-                    exit_reason = "STOP_GAP"
-                    exit_index = j
+                    exit_price = candle["open"] * (1 - SLIPPAGE_RATE)
+                    exit_reason, exit_i = "STOP_GAP", j
                     break
-
                 if candle["open"] >= target:
-                    exit_price = candle["open"] * (
-                        1 - SLIPPAGE_RATE
-                    )
-                    exit_reason = "TARGET_GAP"
-                    exit_index = j
+                    exit_price = candle["open"] * (1 - SLIPPAGE_RATE)
+                    exit_reason, exit_i = "TARGET_GAP", j
                     break
-
-                hit_stop = candle["low"] <= stop
-                hit_target = candle["high"] >= target
-
-                # إذا لمس السعر الهدف والوقف في الشمعة
-                # نفسها، نحتسب الوقف أولًا بحذر.
-                if hit_stop:
-                    exit_price = stop * (
-                        1 - SLIPPAGE_RATE
-                    )
-                    exit_reason = "STOP"
-                    exit_index = j
+                if candle["low"] <= stop:
+                    exit_price = stop * (1 - SLIPPAGE_RATE)
+                    exit_reason, exit_i = "STOP", j
                     break
-
-                if hit_target:
-                    exit_price = target * (
-                        1 - SLIPPAGE_RATE
-                    )
-                    exit_reason = "TARGET"
-                    exit_index = j
+                if candle["high"] >= target:
+                    exit_price = target * (1 - SLIPPAGE_RATE)
+                    exit_reason, exit_i = "TARGET", j
                     break
-
             else:
                 if candle["open"] >= stop:
-                    exit_price = candle["open"] * (
-                        1 + SLIPPAGE_RATE
-                    )
-                    exit_reason = "STOP_GAP"
-                    exit_index = j
+                    exit_price = candle["open"] * (1 + SLIPPAGE_RATE)
+                    exit_reason, exit_i = "STOP_GAP", j
                     break
-
                 if candle["open"] <= target:
-                    exit_price = candle["open"] * (
-                        1 + SLIPPAGE_RATE
-                    )
-                    exit_reason = "TARGET_GAP"
-                    exit_index = j
+                    exit_price = candle["open"] * (1 + SLIPPAGE_RATE)
+                    exit_reason, exit_i = "TARGET_GAP", j
+                    break
+                if candle["high"] >= stop:
+                    exit_price = stop * (1 + SLIPPAGE_RATE)
+                    exit_reason, exit_i = "STOP", j
+                    break
+                if candle["low"] <= target:
+                    exit_price = target * (1 + SLIPPAGE_RATE)
+                    exit_reason, exit_i = "TARGET", j
                     break
 
-                hit_stop = candle["high"] >= stop
-                hit_target = candle["low"] <= target
-
-                if hit_stop:
-                    exit_price = stop * (
-                        1 + SLIPPAGE_RATE
-                    )
-                    exit_reason = "STOP"
-                    exit_index = j
-                    break
-
-                if hit_target:
-                    exit_price = target * (
-                        1 + SLIPPAGE_RATE
-                    )
-                    exit_reason = "TARGET"
-                    exit_index = j
-                    break
-
-        # إذا لم يصل السعر إلى الوقف أو الهدف.
         if exit_price is None:
-            exit_index = last_index
-            close_price = candles[exit_index]["close"]
-
-            if side == "long":
-                exit_price = close_price * (
-                    1 - SLIPPAGE_RATE
-                )
-            else:
-                exit_price = close_price * (
-                    1 + SLIPPAGE_RATE
-                )
-
+            exit_i = last_i
+            close_price = candles[exit_i]["close"]
+            exit_price = close_price * (1 - SLIPPAGE_RATE if side == "long" else 1 + SLIPPAGE_RATE)
             exit_reason = "TIME_EXIT"
 
-        if side == "long":
-            gross_pnl = units * (exit_price - entry)
-        else:
-            gross_pnl = units * (entry - exit_price)
-
-        entry_fee = units * entry * FEE_RATE
-        exit_fee = units * exit_price * FEE_RATE
-
-        net_pnl = gross_pnl - entry_fee - exit_fee
-
+        gross_pnl = units * ((exit_price - entry) if side == "long" else (entry - exit_price))
+        fees = units * entry * FEE_RATE + units * exit_price * FEE_RATE
+        net_pnl = gross_pnl - fees
         balance += net_pnl
-
-        peak_balance = max(peak_balance, balance)
-
-        if peak_balance > 0:
-            drawdown = (
-                (peak_balance - balance) / peak_balance
-            ) * 100
-            max_drawdown = max(max_drawdown, drawdown)
+        peak = max(peak, balance)
+        if peak > 0:
+            max_dd = max(max_dd, (peak - balance) / peak * 100)
 
         trades.append({
-            "side": side,
-            "entry": entry,
-            "exit": exit_price,
-            "pnl": net_pnl,
-            "reason": exit_reason,
-            "entry_index": entry_index,
-            "exit_index": exit_index,
+            "side": side, "pnl": net_pnl, "reason": exit_reason,
+            "entry_ts": candles[entry_i]["ts"], "exit_ts": candles[exit_i]["ts"],
+            "entry": entry, "exit": exit_price,
         })
-
-        # منع الصفقات المتداخلة في الاختبار.
-        i = exit_index + 1
+        i = exit_i + 1  # no overlapping positions
 
         if balance <= 0:
             break
 
+    wins = [t for t in trades if t["pnl"] > 0]
+    losses = [t for t in trades if t["pnl"] <= 0]
+    gross_profit = sum(t["pnl"] for t in wins)
+    gross_loss = abs(sum(t["pnl"] for t in losses))
+    pf = gross_profit / gross_loss if gross_loss else (float("inf") if gross_profit else 0.0)
+    reasons = {}
+    sides = {}
+    for t in trades:
+        reasons[t["reason"]] = reasons.get(t["reason"], 0) + 1
+        sides.setdefault(t["side"], []).append(t["pnl"])
+
     return {
-        "trades": trades,
-        "balance": balance,
-        "net": balance - START_BALANCE,
-        "drawdown": max_drawdown,
+        "trades": trades, "balance": balance, "net": balance - START_BALANCE,
+        "drawdown": max_dd, "wins": len(wins), "losses": len(losses),
+        "win_rate": len(wins) / len(trades) * 100 if trades else 0.0,
+        "gross_profit": gross_profit, "gross_loss": gross_loss,
+        "profit_factor": pf, "reasons": reasons, "sides": sides,
     }
 
 
-# =========================================================
-# طباعة النتائج
-# =========================================================
-
-def print_results(name, result):
-    trades = result["trades"]
-
-    wins = [t for t in trades if t["pnl"] > 0]
-    losses = [t for t in trades if t["pnl"] <= 0]
-
-    gross_profit = sum(t["pnl"] for t in wins)
-    gross_loss = abs(sum(t["pnl"] for t in losses))
-
-    if gross_loss > 0:
-        profit_factor = gross_profit / gross_loss
-    elif gross_profit > 0:
-        profit_factor = float("inf")
-    else:
-        profit_factor = 0.0
-
-    win_rate = (
-        len(wins) / len(trades) * 100
-        if trades else 0.0
-    )
-
-    print(f"\n--- {name} ---")
-    print("Trades:", len(trades))
-    print("Wins:", len(wins))
-    print("Losses:", len(losses))
-    print(f"Win rate: {win_rate:.2f}%")
-    print(f"Gross profit: {gross_profit:.2f} USDT")
-    print(f"Gross loss: {gross_loss:.2f} USDT")
-
-    if profit_factor == float("inf"):
-        print("Profit factor: Infinite (no losing trades)")
-    else:
-        print(f"Profit factor: {profit_factor:.2f}")
-
+def print_results(label, result):
+    pf = result["profit_factor"]
+    pf_text = "inf" if pf == float("inf") else f"{pf:.2f}"
+    print(f"\n{label}")
+    print("-" * 48)
+    print("Trades:", len(result["trades"]))
+    print("Wins / losses:", result["wins"], "/", result["losses"])
+    print(f"Win rate: {result['win_rate']:.2f}%")
+    print(f"Gross profit: {result['gross_profit']:.2f} USDT")
+    print(f"Gross loss: {result['gross_loss']:.2f} USDT")
+    print("Profit factor:", pf_text)
     print(f"Net P/L: {result['net']:.2f} USDT")
-    print(
-        f"Return: {result['net'] / START_BALANCE * 100:.2f}%"
-    )
+    print(f"Return: {result['net'] / START_BALANCE * 100:.2f}%")
     print(f"Max drawdown: {result['drawdown']:.2f}%")
     print(f"Final balance: {result['balance']:.2f} USDT")
+    print("Exit reasons:", result["reasons"])
+    for side in ("long", "short"):
+        pnl_list = result["sides"].get(side, [])
+        if pnl_list:
+            side_wins = sum(1 for p in pnl_list if p > 0)
+            print(f"{side.upper()}: {len(pnl_list)} trades, "
+                  f"{side_wins / len(pnl_list) * 100:.2f}% wins, "
+                  f"net {sum(pnl_list):.2f} USDT")
 
-    reasons = {}
-
-    for trade in trades:
-        reasons[trade["reason"]] = (
-            reasons.get(trade["reason"], 0) + 1
-        )
-
-    print("Exit reasons:", reasons)
-
-
-# =========================================================
-# التشغيل الرئيسي
-# =========================================================
 
 def main():
     candles = get_candles()
-
-    if len(candles) < 1000:
-        print(
-            "ERROR: Not enough historical candles. "
-            "Check the OKX API response."
-        )
+    if len(candles) < 3000:
+        print("ERROR: Not enough closed candles. Check the OKX API/data download.")
         return
 
-    print("\nGenerating support/resistance signals...")
-
-    strategies, diagnostics = make_signals(candles)
-
-    split = int(len(candles) * 0.70)
-
-    print("Total candles:", len(candles))
+    ind = calculate_indicators(candles)
+    split = int(len(candles) * TRAIN_FRACTION)
+    print("\nTotal candles:", len(candles))
     print("Development candles:", split)
     print("Out-of-sample candles:", len(candles) - split)
+    print("\nAssumptions: risk 1% of balance per trade before costs; position notional capped at 1x balance;")
+    print("fee and slippage are estimates per side; no funding fees or contract-specific lot sizing.")
+    print("Signals use closed candles; entries use the next candle open; same-candle stop/target assumes stop first.")
 
-    print("\n===== SIGNAL DIAGNOSTICS =====")
-
-    for name, stats in diagnostics.items():
-        print(f"\n{name}")
-        print("Candidates:", stats["candidates"])
-        print("Valid signals:", stats["valid"])
-        print("Rejected stop distance:", stats["invalid_stop"])
-
-    print("\n===== BACKTEST RESULTS =====")
-
-    for name, signals in strategies.items():
-        print("\n" + "=" * 55)
-        print("STRATEGY:", name)
-        print("=" * 55)
-
-        development = backtest(
-            candles,
-            signals,
-            start=LOOKBACK + 1,
-            end=split,
-        )
-
-        out_of_sample = backtest(
-            candles,
-            signals,
-            start=split,
-            end=len(candles) - 1,
-        )
-
+    all_results = []
+    for cfg in CONFIGS:
+        signals = make_signals(candles, ind, cfg)
+        print("\n" + "=" * 60)
+        print("CONFIG:", cfg)
+        development = backtest(candles, signals, start=VOLUME_PERIOD + 3, end=split)
+        oos = backtest(candles, signals, start=split, end=len(candles) - 1)
         print_results("DEVELOPMENT - 70%", development)
-        print_results("OUT OF SAMPLE - 30%", out_of_sample)
+        print_results("OUT OF SAMPLE - 30%", oos)
+        all_results.append((cfg["name"], development, oos))
+
+    print("\n" + "=" * 60)
+    print("SUMMARY - OUT OF SAMPLE")
+    print("Config | Trades | Win rate | PF | Net USDT | Max DD")
+    for name, _, oos in all_results:
+        pf = "inf" if oos["profit_factor"] == float("inf") else f"{oos['profit_factor']:.2f}"
+        print(f"{name:7s} | {len(oos['trades']):6d} | {oos['win_rate']:7.2f}% | "
+              f"{pf:>4s} | {oos['net']:8.2f} | {oos['drawdown']:6.2f}%")
+    print("\nReminder: this is a research backtest, not a promise of profitability or a live-trading recommendation.")
 
 
 if __name__ == "__main__":
