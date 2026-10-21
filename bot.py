@@ -9,6 +9,20 @@ TELEGRAM_URL = (
     f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
 )
 
+INSTRUMENT = "SOL-USDT-SWAP"
+TIMEFRAME = "1m"
+
+# إعدادات استراتيجية الزخم التجريبية
+MOMENTUM_1M_MIN = 0.0008       # تغير 0.08% خلال دقيقة
+MOMENTUM_3M_MIN = 0.0018       # تغير 0.18% خلال 3 دقائق
+VOLUME_MULTIPLIER = 1.20       # حجم أكبر من المتوسط بنسبة 20%
+MIN_BODY_RATIO = 0.45          # الحد الأدنى لقوة جسم الشمعة
+
+ATR_PERIOD = 14
+STOP_ATR_MULTIPLIER = 1.5
+TARGET1_R_MULTIPLIER = 1.0
+TARGET2_R_MULTIPLIER = 1.5
+
 
 def send_message(message):
     response = requests.post(
@@ -28,17 +42,25 @@ def send_message(message):
         raise Exception(f"Telegram error: {result}")
 
 
-def ema(values, period):
+def ema_series(values, period):
+    if not values:
+        return []
+
     alpha = 2 / (period + 1)
-    result = values[0]
+    current = values[0]
+    result = [current]
 
     for value in values[1:]:
-        result = alpha * value + (1 - alpha) * result
+        current = alpha * value + (1 - alpha) * current
+        result.append(current)
 
     return result
 
 
 def calculate_rsi(closes, period=14):
+    if len(closes) < period + 1:
+        return 50.0
+
     changes = [
         closes[i] - closes[i - 1]
         for i in range(len(closes) - period, len(closes))
@@ -51,15 +73,20 @@ def calculate_rsi(closes, period=14):
     avg_loss = sum(losses) / period
 
     if avg_loss == 0:
-        return 100.0
+        return 100.0 if avg_gain > 0 else 50.0
 
     if avg_gain == 0:
         return 0.0
 
-    return 100 - (100 / (1 + avg_gain / avg_loss))
+    relative_strength = avg_gain / avg_loss
+
+    return 100 - (100 / (1 + relative_strength))
 
 
-def calculate_atr(candles, period=14):
+def calculate_atr(candles, period=ATR_PERIOD):
+    if len(candles) < period + 1:
+        raise ValueError("Not enough candles to calculate ATR")
+
     true_ranges = []
 
     for i in range(len(candles) - period, len(candles)):
@@ -75,15 +102,15 @@ def calculate_atr(candles, period=14):
 
         true_ranges.append(true_range)
 
-    return sum(true_ranges) / period
+    return sum(true_ranges) / len(true_ranges)
 
 
-def analyze():
+def get_closed_candles():
     response = requests.get(
         OKX_URL,
         params={
-            "instId": "SOL-USDT-SWAP",
-            "bar": "5m",
+            "instId": INSTRUMENT,
+            "bar": TIMEFRAME,
             "limit": "100"
         },
         timeout=15
@@ -97,110 +124,180 @@ def analyze():
 
     raw_candles = result.get("data", [])
 
-    # استخدام الشموع المكتملة فقط
+    # OKX: confirm=1 يعني أن الشمعة مكتملة
     candles = [
         candle for candle in raw_candles
-        if candle[8] == "1"
+        if len(candle) > 8 and candle[8] == "1"
     ]
 
-    # ترتيب الشموع من الأقدم إلى الأحدث
+    # بيانات OKX تصل عادة من الأحدث إلى الأقدم
     candles.reverse()
 
     if len(candles) < 60:
         raise Exception("Not enough closed candles")
 
+    return candles
+
+
+def analyze():
+    candles = get_closed_candles()
+
     closes = [float(candle[4]) for candle in candles]
+    highs = [float(candle[2]) for candle in candles]
+    lows = [float(candle[3]) for candle in candles]
+    volumes = [float(candle[5]) for candle in candles]
 
     price = closes[-1]
-    candle_time = candles[-1][0]
+    previous_price = closes[-2]
+    price_3m_ago = closes[-4]
 
-    # المتوسطات الحالية
-    ema9 = ema(closes[-60:], 9)
-    ema21 = ema(closes[-60:], 21)
-    ema50 = ema(closes[-60:], 50)
+    last_candle = candles[-1]
+    candle_time = last_candle[0]
 
-    # المتوسطات قبل إغلاق الشمعة الأخيرة
-    previous_closes = closes[-61:-1]
+    candle_open = float(last_candle[1])
+    candle_high = float(last_candle[2])
+    candle_low = float(last_candle[3])
+    candle_close = float(last_candle[4])
 
-    previous_ema9 = ema(previous_closes, 9)
-    previous_ema21 = ema(previous_closes, 21)
+    candle_range = candle_high - candle_low
+
+    if candle_range <= 0:
+        print("No signal: latest candle has no price range.")
+        return
+
+    # حركة السعر خلال دقيقة و3 دقائق
+    momentum_1m = (price / previous_price) - 1
+    momentum_3m = (price / price_3m_ago) - 1
+
+    # متوسط حجم التداول للشموع العشرين السابقة
+    previous_volumes = volumes[-21:-1]
+    average_volume = sum(previous_volumes) / len(previous_volumes)
+
+    if average_volume <= 0:
+        print("No signal: invalid average volume.")
+        return
+
+    current_volume = volumes[-1]
+    volume_ratio = current_volume / average_volume
+
+    # موقع الإغلاق داخل مدى الشمعة
+    close_position = (
+        (candle_close - candle_low) / candle_range
+    )
+
+    body_ratio = (
+        abs(candle_close - candle_open) / candle_range
+    )
+
+    # المتوسطات الأسية
+    ema9 = ema_series(closes, 9)[-1]
+    ema21 = ema_series(closes, 21)[-1]
+    ema50 = ema_series(closes, 50)[-1]
 
     rsi = calculate_rsi(closes)
     atr = calculate_atr(candles)
 
     print(f"Closed candle: {candle_time}")
     print(f"Price: {price:.4f}")
+    print(f"Momentum 1m: {momentum_1m * 100:.3f}%")
+    print(f"Momentum 3m: {momentum_3m * 100:.3f}%")
+    print(f"Volume ratio: {volume_ratio:.2f}x")
+    print(f"Body ratio: {body_ratio:.2f}")
+    print(f"Close position: {close_position:.2f}")
     print(f"EMA 9: {ema9:.4f}")
     print(f"EMA 21: {ema21:.4f}")
     print(f"EMA 50: {ema50:.4f}")
     print(f"RSI: {rsi:.2f}")
     print(f"ATR: {atr:.4f}")
 
-    signal = None
-
-    # شراء: تقاطع صاعد مع اتجاه صاعد وزخم مناسب
-    if (
-        previous_ema9 <= previous_ema21
+    # شروط الزخم الصاعد
+    long_signal = (
+        momentum_1m >= MOMENTUM_1M_MIN
+        and momentum_3m >= MOMENTUM_3M_MIN
+        and volume_ratio >= VOLUME_MULTIPLIER
+        and body_ratio >= MIN_BODY_RATIO
+        and close_position >= 0.70
         and ema9 > ema21
         and price > ema50
-        and 50 < rsi < 68
-    ):
-        signal = "LONG"
+    )
 
-    # بيع: تقاطع هابط مع اتجاه هابط وزخم مناسب
-    elif (
-        previous_ema9 >= previous_ema21
+    # شروط الزخم الهابط
+    short_signal = (
+        momentum_1m <= -MOMENTUM_1M_MIN
+        and momentum_3m <= -MOMENTUM_3M_MIN
+        and volume_ratio >= VOLUME_MULTIPLIER
+        and body_ratio >= MIN_BODY_RATIO
+        and close_position <= 0.30
         and ema9 < ema21
         and price < ema50
-        and 32 < rsi < 50
-    ):
+    )
+
+    if long_signal:
+        signal = "LONG"
+
+    elif short_signal:
         signal = "SHORT"
 
-    if signal is None:
-        print("No trading signal on the latest closed candle.")
+    else:
+        print("No momentum signal on the latest closed candle.")
         return
 
     entry = price
-    risk = atr * 1.5
+    risk = atr * STOP_ATR_MULTIPLIER
 
     if risk <= 0:
         raise Exception("Invalid ATR risk calculation")
 
     if signal == "LONG":
         stop_loss = entry - risk
-        target1 = entry + risk
-        target2 = entry + (2 * risk)
 
-        direction = "LONG 🟢 شراء"
+        target1 = (
+            entry + risk * TARGET1_R_MULTIPLIER
+        )
+
+        target2 = (
+            entry + risk * TARGET2_R_MULTIPLIER
+        )
+
+        direction = "🟢 شراء تجريبي"
 
     else:
         stop_loss = entry + risk
-        target1 = entry - risk
-        target2 = entry - (2 * risk)
 
-        direction = "SHORT 🔴 بيع"
+        target1 = (
+            entry - risk * TARGET1_R_MULTIPLIER
+        )
+
+        target2 = (
+            entry - risk * TARGET2_R_MULTIPLIER
+        )
+
+        direction = "🔴 بيع تجريبي"
 
     message = (
-        "📊 إشارة SOLUSDT Futures\n"
-        "⏱ الفريم: 5 دقائق\n"
-        f"📍 الاتجاه: {direction}\n"
+        "⚡ إشارة زخم لحظي — SOL\n"
+        f"⏱ الفريم: {TIMEFRAME}\n"
+        f"🕒 وقت الشمعة: {candle_time}\n"
+        f"📍 الاتجاه: {direction}\n\n"
         f"💵 سعر الدخول المرجعي: {entry:.4f}\n"
-        f"🛑 وقف الخسارة: {stop_loss:.4f}\n"
+        f"🛑 وقف الخسارة النظري: {stop_loss:.4f}\n"
         f"🎯 الهدف الأول: {target1:.4f}\n"
         f"🎯 الهدف الثاني: {target2:.4f}\n\n"
-        f"📈 EMA 9: {ema9:.4f}\n"
-        f"📉 EMA 21: {ema21:.4f}\n"
-        f"📊 EMA 50: {ema50:.4f}\n"
+        f"🚀 تغير السعر خلال دقيقة: {momentum_1m * 100:.3f}%\n"
+        f"📈 تغير السعر خلال 3 دقائق: {momentum_3m * 100:.3f}%\n"
+        f"📊 حجم التداول مقارنة بالمتوسط: {volume_ratio:.2f}x\n"
+        f"🕯️ قوة جسم الشمعة: {body_ratio:.2f}\n"
         f"RSI: {rsi:.2f}\n"
         f"ATR: {atr:.4f}\n\n"
-        "⚠️ إشارة فنية تجريبية وليست ضماناً للربح.\n"
-        "سعر الدخول مرجعي وقد يتغير قبل التنفيذ.\n"
-        "تحقق من حجم الصفقة والرافعة والتصفية قبل الدخول."
+        "🧪 هذه إشارة تجريبية وليست أمر تداول.\n"
+        "⚠️ لم تُحتسب رسوم التداول والانزلاق السعري.\n"
+        "⚠️ سعر الدخول مرجعي وليس سعر تنفيذ مضمونًا.\n"
+        "لا تستخدمها لتنفيذ صفقة حقيقية قبل الاختبار."
     )
 
     send_message(message)
 
-    print(f"Signal sent successfully: {signal}")
+    print(f"Momentum signal sent: {signal}")
 
 
 if __name__ == "__main__":
