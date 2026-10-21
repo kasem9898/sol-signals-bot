@@ -29,7 +29,8 @@ MAX_HOLD = 10              # exit after at most 10 one-minute candles
 STOP_ATR = 1.2
 TARGET_R = 1.5
 DAYS = 90
-TRAIN_FRACTION = 0.70
+DEV_FRACTION = 0.60
+VALIDATION_FRACTION = 0.20  # final 20% is a chronological holdout
 
 # Compare a small, predefined set of momentum thresholds.
 # Do not pick a configuration using the out-of-sample data and then
@@ -37,7 +38,9 @@ TRAIN_FRACTION = 0.70
 CONFIGS = [
     {"name": "Mild",   "mom1": 0.0005, "mom3": 0.0012, "vol_mult": 1.2, "body_min": 0.45},
     {"name": "Base",   "mom1": 0.0008, "mom3": 0.0018, "vol_mult": 1.2, "body_min": 0.45},
-    {"name": "Strict", "mom1": 0.0010, "mom3": 0.0025, "vol_mult": 1.3, "body_min": 0.50},
+    {"name": "Strict-no-filter", "mom1": 0.0010, "mom3": 0.0025, "vol_mult": 1.3, "body_min": 0.50, "adx_min": 0, "sep_atr_min": 0.0},
+    {"name": "Strict-ADX18", "mom1": 0.0010, "mom3": 0.0025, "vol_mult": 1.3, "body_min": 0.50, "adx_min": 18, "sep_atr_min": 0.0},
+    {"name": "Strict-ADX22-separation", "mom1": 0.0010, "mom3": 0.0025, "vol_mult": 1.3, "body_min": 0.50, "adx_min": 22, "sep_atr_min": 0.15},
 ]
 
 
@@ -143,19 +146,28 @@ def calculate_indicators(candles):
     prior_volume_avg = [None] * n
     body_ratio = [None] * n
     close_location = [None] * n
+    adx = [None] * n
 
     tr_values = []
+    plus_dm_values = []
+    minus_dm_values = []
+    dx_values = []
     alpha_fast = 2 / (EMA_FAST + 1)
     alpha_slow = 2 / (EMA_SLOW + 1)
     ef = es = None
 
     for i in range(n):
         prev_close = close[i - 1] if i else close[i]
-        tr_values.append(max(
+        tr = max(
             high[i] - low[i],
             abs(high[i] - prev_close),
             abs(low[i] - prev_close),
-        ))
+        )
+        tr_values.append(tr)
+        up_move = high[i] - high[i - 1] if i else 0.0
+        down_move = low[i - 1] - low[i] if i else 0.0
+        plus_dm_values.append(up_move if up_move > down_move and up_move > 0 else 0.0)
+        minus_dm_values.append(down_move if down_move > up_move and down_move > 0 else 0.0)
 
         if i == 0:
             ef = es = close[i]
@@ -182,8 +194,23 @@ def calculate_indicators(candles):
             body_ratio[i] = abs(close[i] - candles[i]["open"]) / candle_range
             close_location[i] = (close[i] - low[i]) / candle_range
 
+        # Simple rolling-window ADX approximation (not Wilder-smoothed ADX).
+        if i >= ATR_PERIOD - 1:
+            tr_sum = sum(tr_values[i - ATR_PERIOD + 1:i + 1])
+            p_sum = sum(plus_dm_values[i - ATR_PERIOD + 1:i + 1])
+            m_sum = sum(minus_dm_values[i - ATR_PERIOD + 1:i + 1])
+            if tr_sum > 0:
+                pdi = 100.0 * p_sum / tr_sum
+                mdi = 100.0 * m_sum / tr_sum
+                denom = pdi + mdi
+                dx_values.append(100.0 * abs(pdi - mdi) / denom if denom else 0.0)
+            else:
+                dx_values.append(0.0)
+            if len(dx_values) >= ATR_PERIOD:
+                adx[i] = sum(dx_values[-ATR_PERIOD:]) / ATR_PERIOD
+
     return {
-        "atr": atr, "ema_fast": ema_fast, "ema_slow": ema_slow,
+        "atr": atr, "ema_fast": ema_fast, "ema_slow": ema_slow, "adx": adx,
         "mom1": mom1, "mom3": mom3, "prior_volume_avg": prior_volume_avg,
         "body_ratio": body_ratio, "close_location": close_location,
     }
@@ -206,6 +233,13 @@ def make_signals(candles, ind, cfg):
         body_ok = body >= cfg["body_min"]
         bullish = c["close"] > c["open"]
         bearish = c["close"] < c["open"]
+        adx_value = ind["adx"][i]
+        if cfg.get("adx_min", 0) > 0 and (adx_value is None or adx_value < cfg["adx_min"]):
+            continue
+        separation_atr = abs(ind["ema_fast"][i] - ind["ema_slow"][i]) / atr
+        if separation_atr < cfg.get("sep_atr_min", 0.0):
+            continue
+
         trend_up = ind["ema_fast"][i] > ind["ema_slow"][i]
         trend_down = ind["ema_fast"][i] < ind["ema_slow"][i]
 
@@ -250,7 +284,8 @@ def backtest(candles, signals, start, end):
             stop = entry + stop_distance
             target = entry - stop_distance * TARGET_R
 
-        risk_cash = max(0.0, balance) * RISK_PERCENT
+        entry_balance = balance
+        risk_cash = max(0.0, entry_balance) * RISK_PERCENT
         units_by_risk = risk_cash / stop_distance
         units_by_notional = max(0.0, balance) * MAX_NOTIONAL_MULTIPLE / entry
         units = min(units_by_risk, units_by_notional)
@@ -318,6 +353,8 @@ def backtest(candles, signals, start, end):
             "side": side, "pnl": net_pnl, "reason": exit_reason,
             "entry_ts": candles[entry_i]["ts"], "exit_ts": candles[exit_i]["ts"],
             "entry": entry, "exit": exit_price,
+            "planned_risk_pct": risk_cash / entry_balance * 100 if entry_balance > 0 else 0.0,
+            "actual_stop_risk_pct": (units * stop_distance / entry_balance * 100) if entry_balance > 0 else 0.0,
         })
         i = exit_i + 1  # no overlapping positions
 
@@ -341,6 +378,7 @@ def backtest(candles, signals, start, end):
         "win_rate": len(wins) / len(trades) * 100 if trades else 0.0,
         "gross_profit": gross_profit, "gross_loss": gross_loss,
         "profit_factor": pf, "reasons": reasons, "sides": sides,
+        "avg_actual_stop_risk_pct": sum(t["actual_stop_risk_pct"] for t in trades) / len(trades) if trades else 0.0,
     }
 
 
@@ -359,6 +397,7 @@ def print_results(label, result):
     print(f"Return: {result['net'] / START_BALANCE * 100:.2f}%")
     print(f"Max drawdown: {result['drawdown']:.2f}%")
     print(f"Final balance: {result['balance']:.2f} USDT")
+    print(f"Average planned stop-risk at entry: {result['avg_actual_stop_risk_pct']:.3f}% of balance (before costs; not guaranteed loss cap)")
     print("Exit reasons:", result["reasons"])
     for side in ("long", "short"):
         pnl_list = result["sides"].get(side, [])
@@ -376,33 +415,31 @@ def main():
         return
 
     ind = calculate_indicators(candles)
-    split = int(len(candles) * TRAIN_FRACTION)
+    dev_end = int(len(candles) * DEV_FRACTION)
+    val_end = int(len(candles) * (DEV_FRACTION + VALIDATION_FRACTION))
     print("\nTotal candles:", len(candles))
-    print("Development candles:", split)
-    print("Out-of-sample candles:", len(candles) - split)
-    print("\nAssumptions: risk 1% of balance per trade before costs; position notional capped at 1x balance;")
-    print("fee and slippage are estimates per side; no funding fees or contract-specific lot sizing.")
-    print("Signals use closed candles; entries use the next candle open; same-candle stop/target assumes stop first.")
+    print("Development (first 60%):", dev_end)
+    print("Validation (next 20%):", val_end - dev_end)
+    print("Final chronological holdout (last 20%):", len(candles) - val_end)
+    print("\nAssumptions: risk target 1% before costs, but notional is capped at 1x balance; effective stop-risk can therefore be lower.")
+    print("Fees/slippage are estimates per side; funding, liquidation, exchange lot sizing and contract-specific details are not modeled.")
+    print("Signals use closed candles; entry is next candle open; if stop and target both touch, stop is assumed first.")
+    print("ADX is a simple rolling approximation, not the platform's Wilder-smoothed ADX.")
+    print("\nIMPORTANT: Keep the final 20% as a holdout. Do not pick the best filter by its holdout result.")
 
-    all_results = []
     for cfg in CONFIGS:
         signals = make_signals(candles, ind, cfg)
-        print("\n" + "=" * 60)
-        print("CONFIG:", cfg)
-        development = backtest(candles, signals, start=VOLUME_PERIOD + 3, end=split)
-        oos = backtest(candles, signals, start=split, end=len(candles) - 1)
-        print_results("DEVELOPMENT - 70%", development)
-        print_results("OUT OF SAMPLE - 30%", oos)
-        all_results.append((cfg["name"], development, oos))
+        print("\n" + "=" * 64)
+        print("CONFIG:", cfg["name"], "| ADX minimum:", cfg.get("adx_min", 0),
+              "| EMA separation / ATR minimum:", cfg.get("sep_atr_min", 0.0))
+        dev = backtest(candles, signals, start=VOLUME_PERIOD + 3, end=dev_end)
+        val = backtest(candles, signals, start=dev_end, end=val_end)
+        holdout = backtest(candles, signals, start=val_end, end=len(candles) - 1)
+        print_results("DEVELOPMENT - first 60%", dev)
+        print_results("VALIDATION - next 20%", val)
+        print_results("FINAL HOLDOUT - last 20% (do not optimize on this)", holdout)
 
-    print("\n" + "=" * 60)
-    print("SUMMARY - OUT OF SAMPLE")
-    print("Config | Trades | Win rate | PF | Net USDT | Max DD")
-    for name, _, oos in all_results:
-        pf = "inf" if oos["profit_factor"] == float("inf") else f"{oos['profit_factor']:.2f}"
-        print(f"{name:7s} | {len(oos['trades']):6d} | {oos['win_rate']:7.2f}% | "
-              f"{pf:>4s} | {oos['net']:8.2f} | {oos['drawdown']:6.2f}%")
-    print("\nReminder: this is a research backtest, not a promise of profitability or a live-trading recommendation.")
+    print("\nResearch only: a better result in this sample does not prove future profitability. If any candidate looks promising, test it in paper trading with realistic fees/funding before considering real money.")
 
 
 if __name__ == "__main__":
