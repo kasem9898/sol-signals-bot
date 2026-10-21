@@ -252,7 +252,7 @@ def make_signals(candles, ind, cfg):
     return signals
 
 
-def backtest(candles, signals, start, end):
+def backtest(candles, signals, start, end, side_filter=None):
     balance = START_BALANCE
     peak = balance
     max_dd = 0.0
@@ -261,7 +261,7 @@ def backtest(candles, signals, start, end):
 
     while i < end - 1:
         sig = signals[i]
-        if sig is None:
+        if sig is None or (side_filter is not None and sig["side"] != side_filter):
             i += 1
             continue
 
@@ -417,29 +417,54 @@ def main():
     ind = calculate_indicators(candles)
     dev_end = int(len(candles) * DEV_FRACTION)
     val_end = int(len(candles) * (DEV_FRACTION + VALIDATION_FRACTION))
-    print("\nTotal candles:", len(candles))
+
+    print("\\nTotal candles:", len(candles))
     print("Development (first 60%):", dev_end)
     print("Validation (next 20%):", val_end - dev_end)
     print("Final chronological holdout (last 20%):", len(candles) - val_end)
-    print("\nAssumptions: risk target 1% before costs, but notional is capped at 1x balance; effective stop-risk can therefore be lower.")
+    print("\\nAssumptions: risk target 1% before costs, but notional is capped at 1x balance; effective stop-risk can therefore be lower.")
     print("Fees/slippage are estimates per side; funding, liquidation, exchange lot sizing and contract-specific details are not modeled.")
     print("Signals use closed candles; entry is next candle open; if stop and target both touch, stop is assumed first.")
     print("ADX is a simple rolling approximation, not the platform's Wilder-smoothed ADX.")
-    print("\nIMPORTANT: Keep the final 20% as a holdout. Do not pick the best filter by its holdout result.")
+    print("\\nIMPORTANT: This run compares LONG-only and SHORT-only separately.")
+    print("Do not select a strategy using the final holdout alone. Treat all results as research, not a live-trading recommendation.")
 
-    for cfg in CONFIGS:
+    # Focus on the three stricter candidates; the looser candidates were clearly worse
+    # in the previous test. Both directions are tested independently with the same rules.
+    side_configs = [
+        {"name": "Strict-no-filter", "mom1": 0.0010, "mom3": 0.0025, "vol_mult": 1.3,
+         "body_min": 0.50, "adx_min": 0, "sep_atr_min": 0.0},
+        {"name": "Strict-ADX18", "mom1": 0.0010, "mom3": 0.0025, "vol_mult": 1.3,
+         "body_min": 0.50, "adx_min": 18, "sep_atr_min": 0.0},
+        {"name": "Strict-ADX22-separation", "mom1": 0.0010, "mom3": 0.0025, "vol_mult": 1.3,
+         "body_min": 0.50, "adx_min": 22, "sep_atr_min": 0.15},
+    ]
+
+    segments = [
+        ("DEVELOPMENT - first 60%", VOLUME_PERIOD + 3, dev_end),
+        ("VALIDATION - next 20%", dev_end, val_end),
+        ("FINAL HOLDOUT - last 20% (do not optimize on this)", val_end, len(candles) - 1),
+    ]
+
+    for cfg in side_configs:
         signals = make_signals(candles, ind, cfg)
-        print("\n" + "=" * 64)
+        print("\\n" + "=" * 72)
         print("CONFIG:", cfg["name"], "| ADX minimum:", cfg.get("adx_min", 0),
               "| EMA separation / ATR minimum:", cfg.get("sep_atr_min", 0.0))
-        dev = backtest(candles, signals, start=VOLUME_PERIOD + 3, end=dev_end)
-        val = backtest(candles, signals, start=dev_end, end=val_end)
-        holdout = backtest(candles, signals, start=val_end, end=len(candles) - 1)
-        print_results("DEVELOPMENT - first 60%", dev)
-        print_results("VALIDATION - next 20%", val)
-        print_results("FINAL HOLDOUT - last 20% (do not optimize on this)", holdout)
 
-    print("\nResearch only: a better result in this sample does not prove future profitability. If any candidate looks promising, test it in paper trading with realistic fees/funding before considering real money.")
+        for side_filter, side_label in (("long", "LONG-ONLY / BUY ONLY"),
+                                        ("short", "SHORT-ONLY / SELL ONLY")):
+            print("\\n" + "#" * 64)
+            print(side_label)
+            for segment_label, seg_start, seg_end in segments:
+                result = backtest(
+                    candles, signals, start=seg_start, end=seg_end,
+                    side_filter=side_filter
+                )
+                print_results(segment_label, result)
+
+    print("\\nResearch only: these results do not prove future profitability. The final holdout should remain untouched when choosing rules.")
+    print("If neither direction is robust after realistic costs and forward paper testing, do not deploy either direction with real money.")
 
 
 if __name__ == "__main__":
